@@ -205,7 +205,25 @@ class Queue:
 
     @property
     def age(self):
-        return 0
+        # IWC_R4 — Queue Internal Age.
+        # Time gap (in seconds) between the OLDEST and NEWEST task currently
+        # in the queue, computed purely from task timestamps (not wall clock).
+        # Returns 0 for an empty queue, or for a single-task queue
+        # (oldest == newest → no gap).
+        #
+        # Implementation notes:
+        # - We reuse `_timestamp_for_task` so that both `datetime` and `str`
+        #   timestamp inputs are normalised consistently (and tzinfo is
+        #   stripped, avoiding aware/naive comparison crashes).
+        # - We use `total_seconds()` (NOT `timedelta.seconds`), because the
+        #   latter only returns the 0–86399 component and would silently
+        #   truncate any gap that crosses a 24-hour boundary.
+        # - `int(...)` casts the float to an int as required by the spec
+        #   contract (`age()` returns an integer number of seconds).
+        if not self._queue:
+            return 0
+        timestamps = [self._timestamp_for_task(task) for task in self._queue]
+        return int((max(timestamps) - min(timestamps)).total_seconds())
 
     def purge(self):
         self._queue.clear()
@@ -294,3 +312,4 @@ async def queue_worker():
         logger.info(f"Finished task: {task}")
 ```
 """
+
