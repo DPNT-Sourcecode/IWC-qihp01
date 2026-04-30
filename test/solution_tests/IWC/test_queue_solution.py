@@ -934,26 +934,31 @@ def test_age_returns_integer_type() -> None:
 def test_age_works_with_full_r1_r2_r3_r4_integration() -> None:
     # End-to-end smoke test: age coexists peacefully with all prior rounds'
     # ordering rules and is computed correctly throughout a non-trivial run.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT promote
+    # bank_statements — this test exercises R1+R2+R3+R4 composition, with R5
+    # exercised separately by the dedicated R5 suite below.
     queue = QueueSolutionEntrypoint()
 
-    # Phase 1: build up a complex queue
+    # Phase 1: build up a complex queue (all timestamps within 4 minutes)
     queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
-    queue.enqueue(TaskSubmission("credit_check", 1, iso_ts(delta_minutes=5)))      # dep: companies_house dedup'd
-    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=10)))  # rule of 3 fires
-    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=20)))
-    # Queue: [companies_house@0, credit_check@5, bank_statements@10, id_verification@20]
-    assert queue.age() == 1200  # 20 min
+    queue.enqueue(TaskSubmission("credit_check", 1, iso_ts(delta_minutes=1)))     # dep: companies_house dedup'd
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=2)))  # rule of 3 fires
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=4)))
+    # Queue: [companies_house@0, credit_check@1, bank_statements@2, id_verification@4]
+    assert queue.age() == 240   # 4 min
 
     # Phase 2: dequeue HIGH block in R3-correct order
     assert queue.dequeue().provider == "companies_house"  # @0 — removes oldest
-    assert queue.age() == 900   # max=20, min=5 → 15 min
+    assert queue.age() == 180   # max=4, min=1 → 3 min
 
-    assert queue.dequeue().provider == "credit_check"     # @5
-    assert queue.age() == 600   # max=20, min=10 → 10 min
+    assert queue.dequeue().provider == "credit_check"     # @1
+    assert queue.age() == 120   # max=4, min=2 → 2 min
 
-    assert queue.dequeue().provider == "id_verification"  # @20 — non-bank wins over bank
-    assert queue.age() == 0     # only bank_statements@10 left
+    assert queue.dequeue().provider == "id_verification"  # @4 — non-bank wins over bank
+    assert queue.age() == 0     # only bank_statements@2 left
 
     assert queue.dequeue().provider == "bank_statements"  # last
     assert queue.age() == 0     # empty
+
 
