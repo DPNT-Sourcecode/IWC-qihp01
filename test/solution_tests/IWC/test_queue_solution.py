@@ -678,3 +678,32 @@ def test_r3_bank_statements_rebucketed_when_rule_of_3_fires_later() -> None:
     assert queue.dequeue() is None
 
 
+def test_r3_full_integration_r1_r2_r3_compose_correctly() -> None:
+    # End-to-end integration scenario exercising all three rounds together:
+    #   • R1: Dependency Resolution (credit_check pulls companies_house)
+    #   • R1: Rule of 3 fires when user 1 hits 3+ unique tasks
+    #   • R2: Dedup drops the dependency-added companies_house duplicate
+    #   • R3: bank_statements lands LAST in user 1's HIGH block,
+    #         even though id_verification has a later timestamp
+    run_queue([
+        # 1) Enqueue companies_house at minute 0
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),
+        # 2) Enqueue credit_check@5 — its dependency (companies_house@5) gets
+        #    R2-dedup'd by the existing companies_house@0 (older wins).
+        #    Net: only credit_check is added → size 2.
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=5)).expect(2),
+        # 3) Enqueue bank_statements@10 — user 1 now has 3 unique tasks → R1 Rule of 3
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(3),
+        # 4) Enqueue id_verification@15 — user 1 has 4 unique tasks (still HIGH)
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=15)).expect(4),
+        # All 4 tasks are HIGH. R3 pushes bank_statements to the END of user 1's
+        # HIGH block — even though id_verification has a LATER timestamp than
+        # bank_statements, the deprioritization tie-breaker fires first.
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("credit_check", 1),
+        call_dequeue().expect("id_verification", 1),     # @15, but non-bank
+        call_dequeue().expect("bank_statements", 1),     # @10, but bank → last
+    ])
+
+
+
