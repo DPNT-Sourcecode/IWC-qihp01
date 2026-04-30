@@ -919,4 +919,3 @@ def test_age_works_with_full_r1_r2_r3_r4_integration() -> None:
 
     assert queue.dequeue().provider == "bank_statements"  # last
     assert queue.age() == 0     # empty
-
