@@ -225,5 +225,3 @@ def test_age_returns_a_non_negative_integer() -> None:
     age = queue.age()
     assert isinstance(age, int)
     assert age >= 0
-
-
