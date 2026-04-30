@@ -464,5 +464,3 @@ def test_dequeue_returns_none_after_dedup_collapses_queue() -> None:
 
     assert queue.dequeue() is None
     assert queue.size() == 0
-
-
