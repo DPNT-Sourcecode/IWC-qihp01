@@ -106,10 +106,12 @@ def test_two_tasks_for_user_does_not_trigger_rule_of_3() -> None:
 
 def test_rule_of_3_beats_earlier_timestamp_from_other_user() -> None:
     # Edge case: rule of 3 takes priority over the timestamp rule.
-    # Even though user 2 has an MUCH earlier task, user 1's 3+ tasks win.
+    # Even though user 2 has an earlier task, user 1's 3+ tasks win.
+    # Timestamps kept WITHIN 5 minutes so R5's anti-starvation promotion
+    # doesn't fire and override R3's bank deprioritization.
     run_queue([
-        # User 2 enqueues a very old task
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
+        # User 2 enqueues an earlier task (within 5 min of newest → no R5 promotion)
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=8)).expect(1),
         # User 1 enqueues 3 later tasks
         call_enqueue("companies_house",  1, iso_ts(delta_minutes=10)).expect(2),
         call_enqueue("id_verification",  1, iso_ts(delta_minutes=11)).expect(3),
@@ -128,13 +130,17 @@ def test_dependencies_count_toward_rule_of_3() -> None:
     # task total. A single credit_check enqueue adds 2 tasks (companies_house
     # + credit_check). Adding one more user-1 task brings their total to 3,
     # which triggers rule of 3.
+    #
+    # Timestamps kept WITHIN 5 minutes of one another so R5's anti-starvation
+    # promotion doesn't fire on user 2's bank_statements task and override
+    # rule-of-3's "user 1 wins" expectation.
     run_queue([
         # User 1 enqueues credit_check → adds companies_house + credit_check (2 tasks)
-        call_enqueue("credit_check",   1, iso_ts(delta_minutes=10)).expect(2),
-        # User 2 sneaks in with an earlier task
+        call_enqueue("credit_check",   1, iso_ts(delta_minutes=1)).expect(2),
+        # User 2 sneaks in with an earlier task (within 5 min → no R5 promotion)
         call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(3),
         # Third user-1 task triggers rule of 3
-        call_enqueue("id_verification", 1, iso_ts(delta_minutes=15)).expect(4),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=4)).expect(4),
         # All 3 user-1 tasks come out first (in insertion order),
         # then user 2's task — even though user 2 had the earliest timestamp.
         call_dequeue().expect("companies_house", 1),
@@ -253,17 +259,24 @@ def test_dedup_canonical_example_from_challenge() -> None:
     # Duplicate at 12:05 is dropped → queue size stays at 1.
     # Then id_verification@12:05 is added → size becomes 2.
     #
-    # NOTE: R2's spec example expected bank_statements to dequeue FIRST.
-    # IWC_R3 supersedes that ordering — bank_statements is now deprioritized,
-    # so id_verification (the non-bank task) wins. The dedup behaviour itself
-    # is unchanged; only the dequeue order shifts due to R3.
+    # NOTE on rule interactions:
+    #   - R2's spec example expected bank_statements to dequeue FIRST.
+    #   - R3 alone would have flipped this to id_verification first
+    #     (bank_statements is deprioritized).
+    #   - R5 PROMOTES the bank_statements task here: its internal age is
+    #     5 min (12:00 vs newest 12:05) which exactly meets the 5-min
+    #     threshold → it escapes R3 deprioritization and, being older,
+    #     dequeues first. So R5 effectively restores R2's original order.
+    # The dedup behaviour itself is unchanged; only the dequeue order
+    # has been re-shuffled twice across rounds.
     run_queue([
         call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
         call_enqueue("bank_statements", 1, iso_ts(delta_minutes=5)).expect(1),  # dedup
         call_enqueue("id_verification", 1, iso_ts(delta_minutes=5)).expect(2),
-        # R3: id_verification (non-bank) wins, bank_statements is held back
-        call_dequeue().expect("id_verification", 1),
+        # R5: bank_statements is promoted (age = 5 min ≥ threshold) and is
+        # the older task → it dequeues first.
         call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("id_verification", 1),
     ])
 
 
@@ -521,12 +534,15 @@ def test_r3_bank_statements_goes_to_global_end_when_no_rule_of_3() -> None:
     # Sub-rule #1 explicit: bank_statements (no Rule of 3) goes to the global
     # end even when its owner's task has the earliest timestamp AND every
     # other task belongs to a different user.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT fire —
+    # this test isolates the R3 behaviour from R5.
     run_queue([
-        # User 1's bank_statements at the EARLIEST timestamp
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        # User 1's bank_statements at an EARLY timestamp (within 5 min of newest)
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=8)).expect(1),
         # Other users' non-bank tasks at later timestamps
         call_enqueue("companies_house", 2, iso_ts(delta_minutes=10)).expect(2),
-        call_enqueue("id_verification", 3, iso_ts(delta_minutes=20)).expect(3),
+        call_enqueue("id_verification", 3, iso_ts(delta_minutes=12)).expect(3),
         # All non-bank tasks come out first (in timestamp order),
         # bank_statements LAST.
         call_dequeue().expect("companies_house", 2),
@@ -558,10 +574,13 @@ def test_r3_rule_of_3_user_bank_statements_is_last_in_their_high_block() -> None
 def test_r3_rule_of_3_bank_statements_with_earliest_ts_still_last_in_block() -> None:
     # Sub-rule #2 stress check: even when bank_statements has the EARLIEST
     # timestamp within a user's HIGH block, it's still pushed to the end.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT fire —
+    # this test focuses purely on R3's in-block deprioritization.
     run_queue([
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),  # earliest
-        call_enqueue("companies_house", 1, iso_ts(delta_minutes=5)).expect(2),
-        call_enqueue("id_verification", 1, iso_ts(delta_minutes=10)).expect(3),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=4)).expect(1),  # earliest
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=6)).expect(2),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=8)).expect(3),
         # All 3 are HIGH; bank_statements LAST despite earliest timestamp
         call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 1),
@@ -592,9 +611,12 @@ def test_r3_high_bank_statements_beats_normal_bank_statements_from_other_user() 
     # When two users both have bank_statements but only one has Rule of 3,
     # the HIGH user's bank_statements still beats the NORMAL user's bank_statements.
     # Priority tier ALWAYS wins first, regardless of deprioritization.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT promote
+    # user 2's NORMAL bank ahead of user 1's HIGH block.
     run_queue([
-        # User 2: NORMAL bank_statements at the EARLIEST timestamp
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
+        # User 2: NORMAL bank_statements at an early timestamp (within 5 min)
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=9)).expect(1),
         # User 1: 3 distinct tasks → HIGH
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(2),
         call_enqueue("id_verification", 1, iso_ts(delta_minutes=11)).expect(3),
@@ -610,15 +632,18 @@ def test_r3_high_bank_statements_beats_normal_bank_statements_from_other_user() 
 def test_r3_multiple_users_with_bank_statements_at_global_end_in_timestamp_order() -> None:
     # When multiple users (none on Rule of 3) have bank_statements, they all
     # land at the global end and tie-break among themselves by Timestamp Ordering.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT promote
+    # any of the bank_statements tasks ahead of the non-bank.
     run_queue([
         # 3 users, each enqueueing a bank_statements at different timestamps
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=20)).expect(1),
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=10)).expect(2),
-        call_enqueue("bank_statements", 3, iso_ts(delta_minutes=30)).expect(3),
-        # A non-bank task with a much LATER timestamp
-        call_enqueue("companies_house", 4, iso_ts(delta_minutes=100)).expect(4),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=1)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(2),  # earliest
+        call_enqueue("bank_statements", 3, iso_ts(delta_minutes=2)).expect(3),
+        # A non-bank task at a LATER timestamp (still within 5 min of oldest)
+        call_enqueue("companies_house", 4, iso_ts(delta_minutes=4)).expect(4),
         # companies_house wins (any non-bank beats any bank in same priority bucket),
-        # then bank_statements in timestamp order (10, 20, 30)
+        # then bank_statements in timestamp order (0, 1, 2)
         call_dequeue().expect("companies_house", 4),
         call_dequeue().expect("bank_statements", 2),  # earliest bank
         call_dequeue().expect("bank_statements", 1),
@@ -655,15 +680,20 @@ def test_r3_bank_statements_rebucketed_when_rule_of_3_fires_later() -> None:
     # so it goes to the global end). Later, they enqueue 2 more distinct tasks
     # which triggers Rule of 3 → bank_statements is now HIGH and lands at
     # the end of THEIR HIGH block, no longer at the global tail.
+    #
+    # Timestamps kept WITHIN 5 minutes throughout so R5 anti-starvation
+    # never fires on user 1's bank_statements — this test is about R3's
+    # dynamic bucketing only.
     queue = QueueSolutionEntrypoint()
 
-    # Phase 1: user 1 has only bank_statements (NORMAL), user 2 wins by timestamp
-    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
-    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=100)))
+    # Phase 1: user 1 has only bank_statements (NORMAL), user 2 wins as non-bank
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=4)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=4)))
     first = queue.dequeue()
     assert first.provider == "companies_house" and first.user_id == 2
 
-    # Phase 2: user 1 gets 2 more distinct tasks → rule of 3 fires next dequeue
+    # Phase 2: user 1 gets 2 more distinct tasks → rule of 3 fires next dequeue.
+    # Timestamps stay within 5 min of user 1's bank @4 so R5 doesn't promote it.
     queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=5)))
     queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=6)))
 
@@ -685,24 +715,28 @@ def test_r3_full_integration_r1_r2_r3_compose_correctly() -> None:
     #   • R2: Dedup drops the dependency-added companies_house duplicate
     #   • R3: bank_statements lands LAST in user 1's HIGH block,
     #         even though id_verification has a later timestamp
+    #
+    # All timestamps kept WITHIN 5 minutes of each other so R5 anti-starvation
+    # promotion does NOT fire on bank_statements (gap from @2 to @4 = 2 min).
+    # This isolates R1+R2+R3 composition from R5 interference.
     run_queue([
         # 1) Enqueue companies_house at minute 0
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),
-        # 2) Enqueue credit_check@5 — its dependency (companies_house@5) gets
+        # 2) Enqueue credit_check@1 — its dependency (companies_house@1) gets
         #    R2-dedup'd by the existing companies_house@0 (older wins).
         #    Net: only credit_check is added → size 2.
-        call_enqueue("credit_check", 1, iso_ts(delta_minutes=5)).expect(2),
-        # 3) Enqueue bank_statements@10 — user 1 now has 3 unique tasks → R1 Rule of 3
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(3),
-        # 4) Enqueue id_verification@15 — user 1 has 4 unique tasks (still HIGH)
-        call_enqueue("id_verification", 1, iso_ts(delta_minutes=15)).expect(4),
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=1)).expect(2),
+        # 3) Enqueue bank_statements@2 — user 1 now has 3 unique tasks → R1 Rule of 3
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=2)).expect(3),
+        # 4) Enqueue id_verification@4 — user 1 has 4 unique tasks (still HIGH)
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=4)).expect(4),
         # All 4 tasks are HIGH. R3 pushes bank_statements to the END of user 1's
         # HIGH block — even though id_verification has a LATER timestamp than
         # bank_statements, the deprioritization tie-breaker fires first.
         call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("credit_check", 1),
-        call_dequeue().expect("id_verification", 1),     # @15, but non-bank
-        call_dequeue().expect("bank_statements", 1),     # @10, but bank → last
+        call_dequeue().expect("id_verification", 1),    # @4, but non-bank
+        call_dequeue().expect("bank_statements", 1),    # @2, but bank → last
     ])
 
 
@@ -819,18 +853,21 @@ def test_age_unchanged_when_middle_timestamp_task_is_dequeued() -> None:
     # When the dequeued task is NEITHER the oldest nor the newest by timestamp,
     # age must stay the same. We use R3 deprioritization to force a
     # middle-timestamp non-bank task to pop first ahead of the bank tasks.
+    #
+    # Timestamps kept WITHIN 5 minutes so R5 anti-starvation does NOT promote
+    # bank_statements task 1 ahead of the non-bank middle task.
     queue = QueueSolutionEntrypoint()
-    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))   # oldest, but bank
-    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=5)))   # middle, non-bank
-    queue.enqueue(TaskSubmission("bank_statements", 3, iso_ts(delta_minutes=10)))  # newest, but bank
-    assert queue.age() == 600  # 10 min
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=1)))   # oldest, but bank
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=2)))   # middle, non-bank
+    queue.enqueue(TaskSubmission("bank_statements", 3, iso_ts(delta_minutes=4)))   # newest, but bank
+    assert queue.age() == 180  # 3 min gap (4 - 1)
 
-    # R3: non-bank middle-timestamp task pops first
+    # R3: non-bank middle-timestamp task pops first (no R5 promotion at <5 min gap)
     first = queue.dequeue()
     assert first.provider == "companies_house" and first.user_id == 2
 
-    # Oldest (@0) and newest (@10) are still present → age unchanged
-    assert queue.age() == 600
+    # Oldest (@1) and newest (@4) are still present → age unchanged
+    assert queue.age() == 180
 
 
 def test_age_includes_bank_statements_in_calculation() -> None:
@@ -919,3 +956,4 @@ def test_age_works_with_full_r1_r2_r3_r4_integration() -> None:
 
     assert queue.dequeue().provider == "bank_statements"  # last
     assert queue.age() == 0     # empty
+
