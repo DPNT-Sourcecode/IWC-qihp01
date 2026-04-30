@@ -411,3 +411,58 @@ def test_dedup_three_consecutive_duplicates_collapse_to_one() -> None:
         call_dequeue().expect("id_verification", 2),
     ])
 
+
+def test_dedup_re_enqueue_credit_check_with_older_timestamp_replaces_both() -> None:
+    # Re-enqueueing credit_check exercises BOTH dedup paths in a single call:
+    # the dependency (companies_house) AND the parent (credit_check).
+    # When the new enqueue is OLDER, both existing tasks must be replaced.
+    run_queue([
+        # First enqueue @minute 5 → [companies_house@5, credit_check@5]
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=5)).expect(2),
+        # Second enqueue @minute 0 → both parts replaced, size still 2
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=0)).expect(2),
+        # Competitor at minute 2 — only beaten if BOTH replacements actually happened
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(3),
+        # User 1 tasks (now @minute 0) win over user 2 (@minute 2)
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("credit_check", 1),
+        call_dequeue().expect("bank_statements", 2),
+    ])
+
+
+def test_dedup_re_enqueue_credit_check_with_newer_timestamp_drops_both() -> None:
+    # Mirror of the above: when the re-enqueue is NEWER, both new parts are
+    # dropped and the original timestamps stay in place.
+    run_queue([
+        # Original enqueue @minute 0
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=0)).expect(2),
+        # Newer re-enqueue @minute 10 → both parts dropped, size stays 2
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=10)).expect(2),
+        # Competitor at minute 5 — user 1 (@minute 0) still wins because
+        # the original timestamps were preserved
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=5)).expect(3),
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("credit_check", 1),
+        call_dequeue().expect("bank_statements", 2),
+    ])
+
+
+def test_dequeue_returns_none_after_dedup_collapses_queue() -> None:
+    # Contract guarantee: after dedup collapses two enqueues into one task,
+    # the queue is genuinely at size 1 — dequeue twice yields exactly one
+    # real task and then None. Catches any off-by-one in _find_duplicate
+    # or _queue.remove that might leave a phantom entry behind.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=5)))  # dedup
+    assert queue.size() == 1
+
+    first = queue.dequeue()
+    assert first is not None
+    assert first.provider == "bank_statements"
+    assert first.user_id == 1
+
+    assert queue.dequeue() is None
+    assert queue.size() == 0
+
+
