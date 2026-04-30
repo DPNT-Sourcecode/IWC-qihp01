@@ -266,17 +266,27 @@ class Queue:
         #   3. is_deprioritized — non-bank (False) beats bank (True). R5-promoted
         #                      banks short-circuit this to False — see lambda
         #                      below: `_is_deprioritized(i) and not promoted`.
-        #   4. timestamp — final tie-breaker. Older timestamp wins, which honours
-        #                      both R1 Timestamp Ordering AND R5's "promoted bank
-        #                      must not skip older-timestamp tasks" constraint.
-        # FIFO ties among same-key tasks are preserved automatically because
-        # Python's `list.sort` is stable.
+        #   4. timestamp — older timestamp wins, which honours both R1 Timestamp
+        #                      Ordering AND R5's "promoted bank must not skip
+        #                      older-timestamp tasks" constraint.
+        #   5. NOT promoted  — final tie-breaker. When a promoted bank and a
+        #                      non-promoted task tie on cols 1-4 (same priority,
+        #                      group, deprio-status AND identical timestamp),
+        #                      the spec's clause (a) of R5 ("come earlier in the
+        #                      queue, even before tasks that would normally take
+        #                      priority") demands the promoted bank wins.
+        #                      `False (promoted) < True (not promoted)` does it.
+        #                      Server scenario IWC_R5_S5 is the canonical witness:
+        #                      ch@12:00 + bank@12:00 (promoted) → bank must dequeue first.
+        # FIFO ties among same-key tasks (e.g. two promoted banks at the same
+        # ts) are preserved automatically because Python's `list.sort` is stable.
         self._queue.sort(
             key=lambda i: (
                 self._priority_for_task(i),
                 self._earliest_group_timestamp_for_task(i),
                 self._is_deprioritized(i) and not i.metadata.get("promoted"),
                 self._timestamp_for_task(i),
+                not i.metadata.get("promoted"),
             )
         )
 

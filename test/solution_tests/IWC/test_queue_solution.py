@@ -1151,6 +1151,31 @@ def test_r5_promotion_works_in_pure_normal_queue() -> None:
     ])
 
 
+def test_r5_promoted_bank_at_same_ts_as_non_bank_wins_tie() -> None:
+    # REGRESSION — server scenario IWC_R5_S5.
+    # When a promoted bank_statements and a non-bank task share the SAME
+    # timestamp (and therefore tie on priority/group/deprio/ts), R5 spec
+    # clause (a) — "come earlier in the queue, even before tasks that
+    # would normally take priority" — requires the promoted bank to win.
+    # Stable-sort FIFO (which would favour the earlier-enqueued non-bank)
+    # is NOT acceptable here. The 5th sort-key column (`not promoted`)
+    # encodes this preference.
+    #
+    # Setup mirrors the failing server scenario exactly:
+    #   ch @12:00 user 1   (enqueued first, NOT promoted)
+    #   bank @12:00 user 1 (enqueued second, promoted by 6-min gap to id_v)
+    #   id_v @12:06 user 6 (newest, sets the age clock)
+    run_queue([
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(2),
+        call_enqueue("id_verification", 6, iso_ts(delta_minutes=6)).expect(3),
+        # Promoted bank wins the same-ts tie despite being enqueued LATER
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 6),
+    ])
+
+
 # ─── R5 in HIGH context (someone is on Rule of 3) ────────────────────────────
 
 def test_r5_promoted_bank_jumps_into_high_block_and_competes_inside_it() -> None:
@@ -1453,5 +1478,3 @@ def test_r5_full_integration_all_rounds_compose_correctly() -> None:
     assert fifth.provider == "companies_house" and fifth.user_id == 3
     assert queue.dequeue() is None
     assert queue.age() == 0
-
-
