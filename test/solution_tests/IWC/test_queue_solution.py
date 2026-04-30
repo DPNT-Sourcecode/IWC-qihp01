@@ -477,3 +477,204 @@ def test_dequeue_returns_none_after_dedup_collapses_queue() -> None:
     assert queue.dequeue() is None
     assert queue.size() == 0
 
+
+# ─── IWC_R3: Bank-statements deprioritization ─────────────────────────────────
+#
+# Spec (challenges/IWC_R3.txt):
+#   bank_statements is a slow provider (heavy parsing). To avoid blocking
+#   faster tasks, it is moved later in processing.
+#
+#   Sub-rule #1 — User has < 3 tasks (no Rule of 3):
+#     Their bank_statements goes to the END OF THE GLOBAL QUEUE.
+#
+#   Sub-rule #2 — User has Rule of 3 (HIGH):
+#     Their bank_statements is scheduled AFTER all THEIR OTHER tasks
+#     (still inside their HIGH block — the block as a whole still beats
+#     other users' NORMAL tasks).
+#
+# All other rules (Rule of 3, Timestamp Ordering, Dependency Resolution,
+# Task Deduplication) still apply.
+#
+# IMPLEMENTATION NOTE — see queue_solution_legacy.py: the sort key gained
+# a new dimension `_is_deprioritized` between `group_earliest_timestamp`
+# and `timestamp`. False sorts before True, so non-bank tasks come out first
+# within the same priority/group bucket.
+
+def test_r3_canonical_example_from_challenge() -> None:
+    # Exact reproduction of the example in IWC_R3.txt lines 18-23.
+    # User 1 enqueues bank_statements first (12:00), then id_verification (12:01).
+    # User 2 enqueues companies_house (12:02). Despite bank_statements having
+    # the earliest timestamp, R3 pushes it to the end of the global queue.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=1)).expect(2),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=2)).expect(3),
+        # Faster tasks first, in timestamp order:
+        call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("companies_house", 2),
+        # bank_statements held back to the very end:
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r3_bank_statements_goes_to_global_end_when_no_rule_of_3() -> None:
+    # Sub-rule #1 explicit: bank_statements (no Rule of 3) goes to the global
+    # end even when its owner's task has the earliest timestamp AND every
+    # other task belongs to a different user.
+    run_queue([
+        # User 1's bank_statements at the EARLIEST timestamp
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        # Other users' non-bank tasks at later timestamps
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=10)).expect(2),
+        call_enqueue("id_verification", 3, iso_ts(delta_minutes=20)).expect(3),
+        # All non-bank tasks come out first (in timestamp order),
+        # bank_statements LAST.
+        call_dequeue().expect("companies_house", 2),
+        call_dequeue().expect("id_verification", 3),
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r3_rule_of_3_user_bank_statements_is_last_in_their_high_block() -> None:
+    # Sub-rule #2 explicit: when a user is on Rule of 3 (HIGH), their
+    # bank_statements lands at the END of THEIR HIGH block — but the HIGH
+    # block as a whole still wins over other users' NORMAL tasks.
+    run_queue([
+        # User 1: 3 distinct tasks → rule of 3 fires (HIGH)
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=5)).expect(1),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=6)).expect(2),  # bank in middle by ts
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=7)).expect(3),
+        # User 2: 1 NORMAL task at the EARLIEST timestamp
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=0)).expect(4),
+        # User 1's whole HIGH block wins over user 2 (NORMAL).
+        # Within user 1: non-bank tasks first by timestamp, bank_statements LAST.
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("bank_statements", 1),  # last in HIGH block
+        call_dequeue().expect("companies_house", 2),  # NORMAL user comes after HIGH
+    ])
+
+
+def test_r3_rule_of_3_bank_statements_with_earliest_ts_still_last_in_block() -> None:
+    # Sub-rule #2 stress check: even when bank_statements has the EARLIEST
+    # timestamp within a user's HIGH block, it's still pushed to the end.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),  # earliest
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=5)).expect(2),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=10)).expect(3),
+        # All 3 are HIGH; bank_statements LAST despite earliest timestamp
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r3_high_bank_statements_still_beats_normal_non_bank() -> None:
+    # Priority hierarchy preserved: a HIGH user's bank_statements still
+    # beats other users' NORMAL non-bank tasks. Priority tier wins before
+    # deprioritization kicks in.
+    run_queue([
+        # User 1: 3 distinct tasks INCLUDING bank_statements → HIGH
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(1),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=11)).expect(2),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=12)).expect(3),
+        # User 2: NORMAL companies_house at LATER timestamp
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=20)).expect(4),
+        # All user 1's HIGH tasks (incl. bank_statements) come BEFORE user 2
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("bank_statements", 1),  # HIGH bank still wins over NORMAL non-bank
+        call_dequeue().expect("companies_house", 2),
+    ])
+
+
+def test_r3_high_bank_statements_beats_normal_bank_statements_from_other_user() -> None:
+    # When two users both have bank_statements but only one has Rule of 3,
+    # the HIGH user's bank_statements still beats the NORMAL user's bank_statements.
+    # Priority tier ALWAYS wins first, regardless of deprioritization.
+    run_queue([
+        # User 2: NORMAL bank_statements at the EARLIEST timestamp
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
+        # User 1: 3 distinct tasks → HIGH
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(2),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=11)).expect(3),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=12)).expect(4),
+        # User 1's HIGH block fully drains first; user 2's NORMAL bank is last
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("bank_statements", 1),  # HIGH bank
+        call_dequeue().expect("bank_statements", 2),  # NORMAL bank → globally last
+    ])
+
+
+def test_r3_multiple_users_with_bank_statements_at_global_end_in_timestamp_order() -> None:
+    # When multiple users (none on Rule of 3) have bank_statements, they all
+    # land at the global end and tie-break among themselves by Timestamp Ordering.
+    run_queue([
+        # 3 users, each enqueueing a bank_statements at different timestamps
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=20)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=10)).expect(2),
+        call_enqueue("bank_statements", 3, iso_ts(delta_minutes=30)).expect(3),
+        # A non-bank task with a much LATER timestamp
+        call_enqueue("companies_house", 4, iso_ts(delta_minutes=100)).expect(4),
+        # companies_house wins (any non-bank beats any bank in same priority bucket),
+        # then bank_statements in timestamp order (10, 20, 30)
+        call_dequeue().expect("companies_house", 4),
+        call_dequeue().expect("bank_statements", 2),  # earliest bank
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("bank_statements", 3),
+    ])
+
+
+def test_r3_bank_only_queue_falls_back_to_timestamp_order() -> None:
+    # If the queue contains ONLY bank_statements tasks, the deprioritization
+    # is moot — they all share is_deprioritized=True so timestamp ordering
+    # decides the outcome (Timestamp Ordering rule still applies).
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(2),
+        call_enqueue("bank_statements", 3, iso_ts(delta_minutes=5)).expect(3),
+        call_dequeue().expect("bank_statements", 2),  # earliest
+        call_dequeue().expect("bank_statements", 3),
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r3_dedup_still_applies_to_bank_statements() -> None:
+    # Backward compat: R2's dedup must still apply to bank_statements.
+    # R3 only changes ordering; the dedup contract is untouched.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=5)).expect(1),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(1),  # dedup
+        call_size().expect(1),
+    ])
+
+
+def test_r3_bank_statements_rebucketed_when_rule_of_3_fires_later() -> None:
+    # Dynamic re-bucketing: a user starts with just bank_statements (NORMAL,
+    # so it goes to the global end). Later, they enqueue 2 more distinct tasks
+    # which triggers Rule of 3 → bank_statements is now HIGH and lands at
+    # the end of THEIR HIGH block, no longer at the global tail.
+    queue = QueueSolutionEntrypoint()
+
+    # Phase 1: user 1 has only bank_statements (NORMAL), user 2 wins by timestamp
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=100)))
+    first = queue.dequeue()
+    assert first.provider == "companies_house" and first.user_id == 2
+
+    # Phase 2: user 1 gets 2 more distinct tasks → rule of 3 fires next dequeue
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=6)))
+
+    # User 1 now has 3 tasks → all HIGH; bank_statements goes last in their block
+    second = queue.dequeue()
+    assert second.user_id == 1 and second.provider == "companies_house"
+    third = queue.dequeue()
+    assert third.user_id == 1 and third.provider == "id_verification"
+    fourth = queue.dequeue()
+    assert fourth.user_id == 1 and fourth.provider == "bank_statements"
+
+    assert queue.dequeue() is None
+
+
