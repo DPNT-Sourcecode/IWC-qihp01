@@ -89,14 +89,16 @@ def test_rule_of_3_user_with_3_tasks_jumps_ahead() -> None:
 def test_two_tasks_for_user_does_not_trigger_rule_of_3() -> None:
     # Edge case: only 2 tasks for user 1 → rule of 3 does NOT activate.
     # Tasks come out in plain timestamp order.
+    # Uses non-bank providers so the R3 bank-statements deprioritization
+    # rule cannot interfere with the timestamp-ordering check.
     run_queue([
         # User 1 has two tasks (later timestamps)
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(1),
         call_enqueue("id_verification", 1, iso_ts(delta_minutes=15)).expect(2),
         # User 2 enqueues one task at the earliest timestamp
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(3),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=0)).expect(3),
         # User 2 wins because no rule of 3 — pure timestamp ordering applies
-        call_dequeue().expect("bank_statements", 2),
+        call_dequeue().expect("companies_house", 2),
         call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 1),
     ])
@@ -247,29 +249,36 @@ def test_age_returns_a_non_negative_integer() -> None:
 #   size=2 here. That's why the fix lives in `enqueue` in the legacy module.
 
 def test_dedup_canonical_example_from_challenge() -> None:
-    # The exact scenario printed in IWC_R2.txt lines 24-28.
+    # The exact dedup scenario printed in IWC_R2.txt lines 24-28.
     # Duplicate at 12:05 is dropped → queue size stays at 1.
     # Then id_verification@12:05 is added → size becomes 2.
-    # Original 12:00 timestamp is preserved, so bank_statements comes out first.
+    #
+    # NOTE: R2's spec example expected bank_statements to dequeue FIRST.
+    # IWC_R3 supersedes that ordering — bank_statements is now deprioritized,
+    # so id_verification (the non-bank task) wins. The dedup behaviour itself
+    # is unchanged; only the dequeue order shifts due to R3.
     run_queue([
         call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
         call_enqueue("bank_statements", 1, iso_ts(delta_minutes=5)).expect(1),  # dedup
         call_enqueue("id_verification", 1, iso_ts(delta_minutes=5)).expect(2),
-        call_dequeue().expect("bank_statements", 1),
+        # R3: id_verification (non-bank) wins, bank_statements is held back
         call_dequeue().expect("id_verification", 1),
+        call_dequeue().expect("bank_statements", 1),
     ])
 
 
 def test_dedup_drops_newer_duplicate_keeps_existing() -> None:
     # When the NEW task is newer than the existing one, the existing wins.
-    # The single remaining task should carry the OLDER timestamp (12:00).
+    # The single remaining task should carry the OLDER timestamp (@minute 0).
+    # Uses non-bank providers so the proof relies purely on Timestamp Ordering
+    # and is not affected by R3's bank-statements deprioritization rule.
     run_queue([
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(1),  # dedup, drop
-        # Add a competitor at minute 5 — still newer than the kept 12:00 task.
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(1),  # dedup, drop
+        # Add a competitor at minute 5 — still newer than the kept @0 task.
         call_enqueue("id_verification", 2, iso_ts(delta_minutes=5)).expect(2),
-        # If the existing 12:00 was kept, it goes first. If the 12:10 had won, id_verification would.
-        call_dequeue().expect("bank_statements", 1),
+        # If the existing @0 was kept, it goes first. If the @10 had won, id_verification would.
+        call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 2),
     ])
 
@@ -278,15 +287,16 @@ def test_dedup_replaces_existing_when_new_is_older() -> None:
     # When the NEW task is OLDER than the existing duplicate, it replaces it.
     # We prove the replacement happened by adding a competitor that sits
     # BETWEEN the two timestamps — only the older replacement wins ahead of it.
+    # Uses non-bank providers so R3 deprioritization doesn't change the order.
     run_queue([
         # Existing duplicate at minute 10
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(1),
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(1),
         # Competitor at minute 5
         call_enqueue("id_verification", 2, iso_ts(delta_minutes=5)).expect(2),
         # New duplicate at minute 0 — older → replaces existing
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(2),
-        # bank_statements (now @minute 0) wins — proving the replacement happened
-        call_dequeue().expect("bank_statements", 1),
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(2),
+        # companies_house (now @minute 0) wins — proving the replacement happened
+        call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 2),
     ])
 
@@ -358,16 +368,17 @@ def test_dedup_does_not_inflate_rule_of_3_count() -> None:
     # task count by re-enqueueing the same provider 3 times. Without dedup
     # this would falsely fire rule of 3. With dedup, user 1 has only 2
     # unique tasks → no rule of 3 → pure timestamp ordering applies.
+    # All non-bank providers so R3 deprioritization doesn't reorder things.
     run_queue([
         # User 2 — earliest
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=0)).expect(1),
         # User 1 — two unique tasks plus a duplicate
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(2),
         call_enqueue("id_verification", 1, iso_ts(delta_minutes=11)).expect(3),
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=12)).expect(3),  # dup
         # User 1 has 2 unique tasks → rule of 3 does NOT fire.
         # Timestamp order wins: user 2 (oldest), then user 1 by timestamp.
-        call_dequeue().expect("bank_statements", 2),
+        call_dequeue().expect("companies_house", 2),
         call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 1),
     ])
@@ -400,14 +411,15 @@ def test_dedup_after_purge_allows_re_enqueue() -> None:
 def test_dedup_three_consecutive_duplicates_collapse_to_one() -> None:
     # Stress check: many duplicates in a row should still collapse to a
     # single task. The OLDEST timestamp must be the one that survives.
+    # Uses non-bank providers so R3 deprioritization doesn't mask the proof.
     run_queue([
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=10)).expect(1),
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=5)).expect(1),   # older → replace
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=20)).expect(1),  # newer → drop
-        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),   # oldest → replace
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(1),
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=5)).expect(1),   # older → replace
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=20)).expect(1),  # newer → drop
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),   # oldest → replace
         # Add a competitor at minute 2 — only beaten if the surviving task is @minute 0
         call_enqueue("id_verification", 2, iso_ts(delta_minutes=2)).expect(2),
-        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("companies_house", 1),
         call_dequeue().expect("id_verification", 2),
     ])
 
@@ -464,3 +476,4 @@ def test_dequeue_returns_none_after_dedup_collapses_queue() -> None:
 
     assert queue.dequeue() is None
     assert queue.size() == 0
+
