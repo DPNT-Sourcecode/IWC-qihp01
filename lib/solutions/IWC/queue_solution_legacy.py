@@ -90,10 +90,38 @@ class Queue:
             return datetime.fromisoformat(timestamp).replace(tzinfo=None)
         return timestamp
 
+    def _find_duplicate(self, user_id: int, provider: str) -> "TaskSubmission | None":
+        """Return the existing queued task with the same (user_id, provider), or None."""
+        for task in self._queue:
+            if task.user_id == user_id and task.provider == provider:
+                return task
+        return None
+
     def enqueue(self, item: TaskSubmission) -> int:
         tasks = [*self._collect_dependencies(item), item]
 
         for task in tasks:
+            # IWC_R2 — Deduplication.
+            # Each (user_id, provider) pair may appear only once in the queue.
+            #
+            # Why dedup happens HERE (in enqueue) rather than in dequeue:
+            # The challenge example in challenges/IWC_R2.txt line 25 shows that
+            # after enqueueing a duplicate, `size = 1` (not 2). That tells us
+            # the duplicate is rejected eagerly at enqueue time, before being
+            # added to the queue. Lazy dedup at dequeue would have shown size=2.
+            #
+            # When resolving a duplicate, the older timestamp wins (Timestamp
+            # Ordering rule). So if the new task is older, it replaces the
+            # existing one; otherwise we drop the new one.
+            existing = self._find_duplicate(task.user_id, task.provider)
+            if existing is not None:
+                new_ts = self._timestamp_for_task(task)
+                existing_ts = self._timestamp_for_task(existing)
+                if new_ts < existing_ts:
+                    self._queue.remove(existing)  # new is older → replace
+                else:
+                    continue                       # existing is older-or-equal → drop new
+
             metadata = task.metadata
             metadata.setdefault("priority", Priority.NORMAL)
             metadata.setdefault("group_earliest_timestamp", MAX_TIMESTAMP)
@@ -242,3 +270,4 @@ async def queue_worker():
         logger.info(f"Finished task: {task}")
 ```
 """
+
