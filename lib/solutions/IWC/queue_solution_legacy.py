@@ -90,6 +90,16 @@ class Queue:
             return datetime.fromisoformat(timestamp).replace(tzinfo=None)
         return timestamp
 
+    # IWC_R3 — providers that must be processed AFTER all other tasks in their
+    # bucket (per challenges/IWC_R3.txt). Stored as a class-level set so future
+    # rounds can extend it (e.g. add more "slow" providers) without touching the
+    # sort logic.
+    DEPRIORITIZED_PROVIDERS: frozenset[str] = frozenset({"bank_statements"})
+
+    @classmethod
+    def _is_deprioritized(cls, task) -> bool:
+        return task.provider in cls.DEPRIORITIZED_PROVIDERS
+
     def _find_duplicate(self, user_id: int, provider: str) -> "TaskSubmission | None":
         """Return the existing queued task with the same (user_id, provider), or None."""
         for task in self._queue:
@@ -161,10 +171,24 @@ class Queue:
                 metadata["group_earliest_timestamp"] = current_earliest
                 metadata["priority"] = priority_level
 
+        # IWC_R3 — Bank-statements deprioritization.
+        # The 4-tuple sort key encodes:
+        #   1. priority      — HIGH (rule of 3) beats NORMAL globally
+        #   2. group_earliest_timestamp — within HIGH, oldest user group wins
+        #   3. is_deprioritized — within the same priority/group bucket,
+        #      non-bank_statements (False) beats bank_statements (True).
+        #      • Inside a HIGH user group → user's bank_statements lands last
+        #        among their own tasks (sub-rule #2 of IWC_R3).
+        #      • Across all NORMAL tasks (same group_earliest=MAX) →
+        #        bank_statements lands at the global end of the NORMAL section
+        #        (sub-rule #1 of IWC_R3).
+        #   4. timestamp — final tie-breaker; preserves "Timestamp Ordering"
+        #      among non-bank tasks AND among bank tasks separately.
         self._queue.sort(
             key=lambda i: (
                 self._priority_for_task(i),
                 self._earliest_group_timestamp_for_task(i),
+                self._is_deprioritized(i),
                 self._timestamp_for_task(i),
             )
         )
@@ -270,3 +294,4 @@ async def queue_worker():
         logger.info(f"Finished task: {task}")
 ```
 """
+
