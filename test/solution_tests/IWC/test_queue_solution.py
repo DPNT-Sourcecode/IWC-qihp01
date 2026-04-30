@@ -214,9 +214,9 @@ def test_two_users_both_trigger_rule_of_3_compete_on_earliest_timestamp() -> Non
     assert user_order == [2, 2, 2, 1, 1, 1]
 
 
-# ─── Direct entrypoint tests for purge / age / empty-dequeue ──────────────────
-# The framework helpers don't cover these methods, so we use the entrypoint
-# directly. These prove the full public API works as documented.
+# ─── Public API contract tests (purge / age / empty-dequeue) ─────────────────
+# These cover the corners of the public Queue API that aren't exercised by
+# the main "enqueue + dequeue + assert order" pattern.
 
 def test_dequeue_on_empty_queue_returns_none() -> None:
     # Calling dequeue on an empty queue must return None (not raise).
@@ -237,14 +237,12 @@ def test_purge_clears_all_tasks_and_returns_true() -> None:
 
 
 def test_age_returns_a_non_negative_integer() -> None:
-    # Contract test: age() must return a non-negative int.
-    # The legacy implementation currently always returns 0, but the spec
-    # says "age in seconds" — future rounds may make this dynamic.
-    # We only assert what the SPEC guarantees, not what the legacy bug returns.
-    queue = QueueSolutionEntrypoint()
-    age = queue.age()
-    assert isinstance(age, int)
-    assert age >= 0
+    # Contract test: on an empty queue, age() must return a non-negative int.
+    # R4 makes age() dynamic; this test only asserts the SPEC contract
+    # (type + non-negativity), independent of any specific computation.
+    run_queue([
+        call_age().expect(0),
+    ])
 
 
 # ─── IWC_R2: Task Deduplication ───────────────────────────────────────────────
@@ -763,8 +761,7 @@ def test_r3_full_integration_r1_r2_r3_compose_correctly() -> None:
 #
 # Implementation note: see queue_solution_legacy.py — uses min/max over
 # `_timestamp_for_task(task)` and `total_seconds()` to handle multi-day gaps
-# safely. Note `test_age_returns_a_non_negative_integer` (above) was written
-# at R1 time as a forward-compatible contract test; it still passes here.
+# safely.
 
 def test_age_empty_queue_returns_zero() -> None:
     # Spec contract: empty queue → 0.
@@ -831,11 +828,11 @@ def test_age_returns_zero_after_purge() -> None:
 
 def test_age_with_seconds_precision() -> None:
     # Sub-minute precision: a 30-second gap must produce age=30.
-    # Constructs timestamps directly to bypass the minute-only iso_ts helper.
-    queue = QueueSolutionEntrypoint()
-    queue.enqueue(TaskSubmission("companies_house", 1, "2025-10-20 12:00:00"))
-    queue.enqueue(TaskSubmission("companies_house", 2, "2025-10-20 12:00:30"))
-    assert queue.age() == 30
+    run_queue([
+        call_enqueue("companies_house", 1, iso_ts(delta_seconds=0)).expect(1),
+        call_enqueue("companies_house", 2, iso_ts(delta_seconds=30)).expect(2),
+        call_age().expect(30),
+    ])
 
 
 def test_age_shrinks_when_oldest_is_dequeued() -> None:
@@ -1159,9 +1156,10 @@ def test_r5_promotion_works_in_pure_normal_queue() -> None:
 def test_r5_promoted_bank_jumps_into_high_block_and_competes_inside_it() -> None:
     # Setup: user 1 has 3 distinct tasks → HIGH band, group_earliest=10.
     # User 2 has bank @0 → internal age = 12 min → promoted.
-    # Promoted bank inherits HIGH+group_earliest=10 so it sits INSIDE the
-    # HIGH band, competing on its own timestamp (older than any user-1 task).
-    # Result: user 2's bank goes first, then user 1's HIGH block.
+    # Bank @0 is the OLDEST task, so the "anchor inheritance" rule has no
+    # candidates — it falls back to the best priority band currently in
+    # the queue (HIGH + earliest HIGH group_earliest = 10), letting the
+    # bank dequeue first ahead of the entire HIGH block.
     run_queue([
         call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
         call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(2),
@@ -1435,7 +1433,9 @@ def test_r5_full_integration_all_rounds_compose_correctly() -> None:
     #   newest = 7; user 1 bank gap = 7 min → PROMOTED;
     #   user 2 bank gap = 5 min → PROMOTED.
     # User 1 has 3 unique tasks → HIGH (group_earliest=0). User 2/3 NORMAL.
-    # Both promoted banks inherit HIGH+group_earliest=0.
+    # Anchor inheritance for the two promoted banks:
+    #   • bank user 1 @0 → no anchor (oldest task) → fallback: best band = HIGH/0.
+    #   • bank user 2 @2 → anchor = a HIGH user-1 task at ts=1 → inherits HIGH/0.
     # Sort key (priority, group, !promoted-or-non-bank, ts):
     #   bank user 1 @0           → (HIGH, 0, False, 0)  ← oldest
     #   companies_house user 1@1 → (HIGH, 0, False, 1)
@@ -1453,4 +1453,5 @@ def test_r5_full_integration_all_rounds_compose_correctly() -> None:
     assert fifth.provider == "companies_house" and fifth.user_id == 3
     assert queue.dequeue() is None
     assert queue.age() == 0
+
 
