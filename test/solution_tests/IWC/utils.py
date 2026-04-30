@@ -10,8 +10,18 @@ from solutions.IWC.task_types import TaskDispatch, TaskSubmission
 DEFAULT_SCENARIO_BASE = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
 
 
-def iso_ts(*, base: datetime = DEFAULT_SCENARIO_BASE, delta_minutes: int = 0) -> str:
-    return str(base + timedelta(minutes=delta_minutes))
+def iso_ts(
+    *,
+    base: datetime = DEFAULT_SCENARIO_BASE,
+    delta_minutes: int = 0,
+    delta_seconds: int = 0,
+) -> str:
+    """Build a timestamp string offset from `base`.
+
+    `delta_seconds` enables sub-minute precision for boundary tests
+    (e.g. the IWC_R5 5-minute-promotion threshold edge cases).
+    """
+    return str(base + timedelta(minutes=delta_minutes, seconds=delta_seconds))
 
 
 class QueueActionBuilder:
@@ -50,6 +60,36 @@ def call_dequeue() -> QueueActionBuilder:
     )
 
 
+def call_age() -> QueueActionBuilder:
+    """Declarative wrapper around `queue.age()`.
+
+    Usage:
+        call_age().expect(300)   # expect 300 seconds
+        call_age().expect(0)     # expect empty/single-task → 0
+    """
+    return QueueActionBuilder("age")
+
+
+def call_purge() -> QueueActionBuilder:
+    """Declarative wrapper around `queue.purge()`.
+
+    Usage:
+        call_purge().expect(True)
+    """
+    return QueueActionBuilder("purge")
+
+
+def call_dequeue_empty() -> QueueActionBuilder:
+    """Declarative wrapper for asserting `queue.dequeue() is None`.
+
+    The plain `call_dequeue()` builder requires (provider, user_id)
+    arguments because that's the happy-path shape; this variant exists
+    for the "queue has drained" assertion so tests don't need to drop
+    out of the declarative pattern just for the final empty check.
+    """
+    return QueueActionBuilder("dequeue", expect_factory=lambda: None)
+
+
 def run_queue(actions: Iterable[dict[str, Any]]) -> None:
     queue = QueueSolutionEntrypoint()
     for position, step in enumerate(actions, start=1):
@@ -71,4 +111,13 @@ def run_queue(actions: Iterable[dict[str, Any]]) -> None:
             )
 
 
-__all__ = ["iso_ts", "call_enqueue", "call_size", "call_dequeue", "run_queue"]
+__all__ = [
+    "iso_ts",
+    "call_enqueue",
+    "call_size",
+    "call_dequeue",
+    "call_dequeue_empty",
+    "call_age",
+    "call_purge",
+    "run_queue",
+]

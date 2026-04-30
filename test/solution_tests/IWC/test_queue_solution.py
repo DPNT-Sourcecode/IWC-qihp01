@@ -1436,7 +1436,3 @@ def test_r5_full_integration_all_rounds_compose_correctly() -> None:
     assert fifth.provider == "companies_house" and fifth.user_id == 3
     assert queue.dequeue() is None
     assert queue.age() == 0
-
-
-
-
