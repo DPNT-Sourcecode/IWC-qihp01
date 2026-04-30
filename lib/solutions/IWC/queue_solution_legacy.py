@@ -184,26 +184,33 @@ class Queue:
         # IWC_R5 — Time-Sensitive Bank Statements (anti-starvation override of R3).
         # A deprioritized bank_statements task whose internal age (the gap
         # between its timestamp and the NEWEST task's timestamp) reaches
-        # PROMOTION_AGE_THRESHOLD_SECONDS gets "promoted":
-        #   - It escapes R3 deprioritization (False in column 3 of the sort key).
-        #   - If any HIGH-priority tasks are currently in the queue, it inherits
-        #     the highest priority band (HIGH + the earliest HIGH group_earliest)
-        #     so it can skip ahead of HIGH non-bank tasks with NEWER timestamps
-        #     (per the spec's example #2). It still cannot skip OLDER-timestamp
-        #     tasks because column 4 of the sort key is the task's own timestamp.
-        #   - If no HIGH tasks exist, removing deprioritization is sufficient
-        #     (per the spec's example #1).
-        # Promotion is recomputed at every dequeue so it stays correct as tasks
-        # come and go (it depends on the current "newest" task in the queue).
+        # PROMOTION_AGE_THRESHOLD_SECONDS gets "promoted".
+        #
+        # The spec has TWO promotion clauses:
+        #   (a) "It is allowed to come earlier in the queue, even before
+        #        tasks that would normally take priority."
+        #   (b) "Still, it should not skip ahead of tasks that have an older
+        #        timestamp than itself."
+        #
+        # To honour BOTH clauses we use an "inherit from anchor" strategy:
+        #   - Identify promoted banks (gap ≥ threshold) up front.
+        #   - For each promoted bank B, find the ANCHOR: the non-promoted task
+        #     with the GREATEST timestamp ≤ B.timestamp. B then inherits the
+        #     anchor's `priority` and `group_earliest_timestamp`. Its R3
+        #     deprioritization flag is unset (column 3 of sort key short-
+        #     circuits via `... and not promoted`). That sort key guarantees:
+        #       * B sorts AFTER the anchor (because B has a strictly greater
+        #         ts within the same priority/group bucket) — clause (b).
+        #       * B sorts BEFORE any non-anchor task in the same band that has
+        #         a newer ts — clause (a).
+        #   - If NO anchor exists (B is the oldest task in the queue), give
+        #     B the best priority band currently in the queue so it dequeues
+        #     first — there is nothing to "skip ahead of" by clause (b).
+        # Promotion is recomputed at every dequeue because both "newest" and
+        # the queue contents change as tasks drain.
         newest_ts = max(self._timestamp_for_task(t) for t in self._queue)
-        high_groups = [
-            t.metadata.get("group_earliest_timestamp", MAX_TIMESTAMP)
-            for t in self._queue
-            if t.metadata.get("priority") == Priority.HIGH
-        ]
-        has_high = bool(high_groups)
-        earliest_high_group_ts = min(high_groups) if has_high else MAX_TIMESTAMP
 
+        promoted_banks = []
         for task in self._queue:
             if not self._is_deprioritized(task):
                 continue
@@ -211,12 +218,44 @@ class Queue:
             age_seconds = (newest_ts - task_ts).total_seconds()
             if age_seconds >= self.PROMOTION_AGE_THRESHOLD_SECONDS:
                 task.metadata["promoted"] = True
-                if has_high:
-                    task.metadata["priority"] = Priority.HIGH
-                    task.metadata["group_earliest_timestamp"] = earliest_high_group_ts
-                # If no HIGH context exists, leave priority=NORMAL and
-                # group_earliest=MAX_TIMESTAMP — the only effect needed in
-                # that case is removing deprioritization in the sort key.
+                promoted_banks.append(task)
+            # else: leave alone — R3 deprioritization continues to apply.
+
+        # Anchor inheritance is computed against the NON-promoted set so
+        # promoted banks don't accidentally chain off each other.
+        non_promoted = [t for t in self._queue if not t.metadata.get("promoted")]
+
+        for bank in promoted_banks:
+            bank_ts = self._timestamp_for_task(bank)
+            anchors = [t for t in non_promoted if self._timestamp_for_task(t) <= bank_ts]
+            if anchors:
+                anchor = max(anchors, key=self._timestamp_for_task)
+                bank.metadata["priority"] = anchor.metadata.get(
+                    "priority", Priority.NORMAL
+                )
+                bank.metadata["group_earliest_timestamp"] = anchor.metadata.get(
+                    "group_earliest_timestamp", MAX_TIMESTAMP
+                )
+            else:
+                # Bank is the oldest task in the queue — give it the best
+                # priority band currently present so it dequeues first.
+                best_priority = min(
+                    (
+                        t.metadata.get("priority", Priority.NORMAL)
+                        for t in non_promoted
+                    ),
+                    default=Priority.NORMAL,
+                )
+                if best_priority == Priority.HIGH:
+                    best_group = min(
+                        t.metadata.get("group_earliest_timestamp", MAX_TIMESTAMP)
+                        for t in non_promoted
+                        if t.metadata.get("priority") == Priority.HIGH
+                    )
+                else:
+                    best_group = MAX_TIMESTAMP
+                bank.metadata["priority"] = best_priority
+                bank.metadata["group_earliest_timestamp"] = best_group
 
         # IWC_R3/R5 — Sort key explanation:
         #   1. priority      — HIGH (rule of 3, OR R5 promotion when HIGH context
@@ -360,4 +399,5 @@ async def queue_worker():
         logger.info(f"Finished task: {task}")
 ```
 """
+
 

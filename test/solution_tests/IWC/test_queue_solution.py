@@ -1163,39 +1163,45 @@ def test_r5_promoted_bank_jumps_into_high_block_and_competes_inside_it() -> None
     ])
 
 
-def test_r5_promoted_bank_with_high_context_cannot_skip_older_normal_task() -> None:
-    # Even with HIGH context, a promoted bank cannot skip a task with an
-    # older timestamp. id_verification (NORMAL) @0 is older than the
-    # promoted bank @2, so it must dequeue first — even though the bank
-    # has been "promoted to HIGH" and id_verification is still NORMAL.
-    # This proves column 4 (timestamp) of the sort key still wins ties.
-    run_queue([
-        call_enqueue("id_verification", 5, iso_ts(delta_minutes=0)).expect(1),  # NORMAL, older
-        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(2),
-        # Build a HIGH user so the promoted bank inherits HIGH+group_earliest
-        call_enqueue("companies_house", 1, iso_ts(delta_minutes=4)).expect(3),
-        call_enqueue("id_verification", 1, iso_ts(delta_minutes=5)).expect(4),
-        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(5),  # newest
-    ])
-    # Re-run with explicit dequeue to verify ordering (the run_queue helper
-    # would otherwise need many lines for this scenario):
+def test_r5_promoted_bank_anchored_to_normal_older_task_does_not_jump_into_high_band() -> None:
+    # The "older timestamp" constraint (R5 spec line 17) is HARD — even when
+    # a HIGH user exists in the queue, a promoted bank cannot leapfrog over
+    # a strictly-older NORMAL task. The bank inherits the priority/group of
+    # the most-recent non-promoted task with ts ≤ bank.ts ("anchor"); when
+    # that anchor is NORMAL, the bank stays NORMAL despite HIGH being present.
+    #
+    # Setup (the cyclic-constraint scenario):
+    #   user 5 NORMAL id_verification @0   ← oldest, anchors the bank
+    #   user 2 PROMOTED bank @2            ← gap to newest @7 = 5 min
+    #   user 1 HIGH companies_house @5     ← user 1 has 3 tasks → HIGH
+    #   user 1 HIGH credit_check @6        ← (depends on companies_house, but
+    #                                         it is dedup'd against user 1 @5 by R2)
+    #   user 1 HIGH id_verification @7     ← newest
+    #
+    # By R1, user 1's HIGH block beats user 5's NORMAL task. By R5 the bank
+    # cannot skip user 5 (older ts) → bank inherits NORMAL/MAX from user 5
+    # → bank ends up after user 5 → transitively after user 1's HIGH block.
+    # The test asserts this exact order.
     queue = QueueSolutionEntrypoint()
     queue.enqueue(TaskSubmission("id_verification", 5, iso_ts(delta_minutes=0)))
     queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=2)))
-    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=4)))
-    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=5)))
-    queue.enqueue(TaskSubmission("companies_house", 3, iso_ts(delta_minutes=7)))
-    # Bank @2, newest @7 → gap = 5 min → PROMOTED. User 1 has only 2 tasks
-    # so no HIGH user exists → promoted bank stays NORMAL/MAX, no inheritance.
-    # Order driven purely by timestamp (R3 deprio off for promoted bank):
-    #   id_verification user 5 @0 → bank user 2 @2 → companies_house user 1 @4
-    #   → id_verification user 1 @5 → companies_house user 3 @7
-    assert queue.dequeue().provider == "id_verification" and queue.size() == 4
-    second = queue.dequeue()
-    assert second.provider == "bank_statements" and second.user_id == 2
-    assert queue.dequeue().provider == "companies_house"
-    assert queue.dequeue().provider == "id_verification"
-    assert queue.dequeue().provider == "companies_house"
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("credit_check",    1, iso_ts(delta_minutes=6)))
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=7)))
+
+    # User 1 unique tasks: companies_house, credit_check, id_verification → 3 → HIGH.
+    # (R2 dedup means credit_check's dependency companies_house@6 is dropped
+    # because companies_house@5 already exists for user 1.)
+    # HIGH block drains first in timestamp order:
+    assert queue.dequeue().provider == "companies_house"  # user 1 HIGH @5
+    assert queue.dequeue().provider == "credit_check"     # user 1 HIGH @6
+    assert queue.dequeue().provider == "id_verification"  # user 1 HIGH @7
+    # Then NORMAL tasks in timestamp order (bank stays NORMAL via anchor):
+    fourth = queue.dequeue()
+    assert fourth.provider == "id_verification" and fourth.user_id == 5  # @0
+    fifth = queue.dequeue()
+    assert fifth.provider == "bank_statements" and fifth.user_id == 2    # @2 (NOT skipped past @0)
+    assert queue.dequeue() is None
 
 
 # ─── R5 multiple banks / mixed eligibility ──────────────────────────────────
@@ -1430,6 +1436,7 @@ def test_r5_full_integration_all_rounds_compose_correctly() -> None:
     assert fifth.provider == "companies_house" and fifth.user_id == 3
     assert queue.dequeue() is None
     assert queue.age() == 0
+
 
 
 
