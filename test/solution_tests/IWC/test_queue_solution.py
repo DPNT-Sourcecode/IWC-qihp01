@@ -704,3 +704,219 @@ def test_r3_full_integration_r1_r2_r3_compose_correctly() -> None:
         call_dequeue().expect("id_verification", 1),     # @15, but non-bank
         call_dequeue().expect("bank_statements", 1),     # @10, but bank → last
     ])
+
+
+# ─── IWC_R4: Queue Internal Age ───────────────────────────────────────────────
+#
+# Spec (challenges/IWC_R4.txt):
+#   age() returns the time gap, in seconds, between the OLDEST and NEWEST
+#   task currently in the queue, based purely on task timestamps.
+#   - Returns 0 if the queue is empty.
+#   - Implicitly returns 0 if there is a single task (oldest == newest).
+#
+# All other rules (R1 Rule of 3 / Timestamp Ordering / Dependency Resolution,
+# R2 Dedup, R3 Bank-statements deprioritization) still apply — age is a pure
+# read-only metric over the current queue contents and doesn't affect ordering.
+#
+# Implementation note: see queue_solution_legacy.py — uses min/max over
+# `_timestamp_for_task(task)` and `total_seconds()` to handle multi-day gaps
+# safely. Note `test_age_returns_a_non_negative_integer` (above) was written
+# at R1 time as a forward-compatible contract test; it still passes here.
+
+def test_age_empty_queue_returns_zero() -> None:
+    # Spec contract: empty queue → 0.
+    queue = QueueSolutionEntrypoint()
+    assert queue.age() == 0
+
+
+def test_age_single_task_returns_zero() -> None:
+    # Single task → oldest == newest → gap = 0.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    assert queue.age() == 0
+
+
+def test_age_canonical_example_from_challenge() -> None:
+    # Exact reproduction of the example in IWC_R4.txt lines 19-21.
+    # Two tasks 5 minutes apart → 5 * 60 = 300 seconds.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("id_verification", 2, iso_ts(delta_minutes=5)))
+    assert queue.age() == 300
+
+
+def test_age_uses_min_max_not_insertion_order() -> None:
+    # The age must be computed over MAX - MIN of the timestamps,
+    # not over (last enqueued - first enqueued) or any insertion ordering.
+    # We enqueue out-of-order to expose any naive implementation.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=10)))
+    queue.enqueue(TaskSubmission("companies_house", 3, iso_ts(delta_minutes=0)))   # oldest
+    queue.enqueue(TaskSubmission("companies_house", 4, iso_ts(delta_minutes=7)))
+    # max=10, min=0 → 10 minutes = 600 seconds
+    assert queue.age() == 600
+
+
+def test_age_all_same_timestamp_returns_zero() -> None:
+    # If every task shares a timestamp, max == min → 0.
+    ts = iso_ts(delta_minutes=0)
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, ts))
+    queue.enqueue(TaskSubmission("id_verification", 2, ts))
+    queue.enqueue(TaskSubmission("companies_house", 3, ts))
+    assert queue.age() == 0
+
+
+def test_age_handles_hour_long_gap() -> None:
+    # Larger gap test: 1 hour = 3600 seconds.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=60)))
+    assert queue.age() == 3600
+
+
+def test_age_returns_zero_after_purge() -> None:
+    # purge() empties the queue; age should immediately drop to 0.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=10)))
+    assert queue.age() == 600
+    queue.purge()
+    assert queue.age() == 0
+
+
+def test_age_with_seconds_precision() -> None:
+    # Sub-minute precision: a 30-second gap must produce age=30.
+    # Constructs timestamps directly to bypass the minute-only iso_ts helper.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, "2025-10-20 12:00:00"))
+    queue.enqueue(TaskSubmission("companies_house", 2, "2025-10-20 12:00:30"))
+    assert queue.age() == 30
+
+
+def test_age_shrinks_when_oldest_is_dequeued() -> None:
+    # Age reflects what's IN the queue. Dequeueing the oldest task should
+    # shrink age. We use 3 distinct users + companies_house → no R3
+    # deprioritization, no Rule of 3 — pure timestamp ordering applies.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))   # oldest
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("companies_house", 3, iso_ts(delta_minutes=10)))  # newest
+    assert queue.age() == 600  # 10 min initially
+
+    queue.dequeue()  # removes user 1 @0 (oldest by timestamp)
+    assert queue.age() == 300  # now 5 min (max=10, min=5)
+
+    queue.dequeue()  # removes user 2 @5
+    assert queue.age() == 0    # only one task left → gap = 0
+
+    queue.dequeue()  # removes user 3 @10 — empty
+    assert queue.age() == 0
+
+
+def test_age_unchanged_when_middle_timestamp_task_is_dequeued() -> None:
+    # When the dequeued task is NEITHER the oldest nor the newest by timestamp,
+    # age must stay the same. We use R3 deprioritization to force a
+    # middle-timestamp non-bank task to pop first ahead of the bank tasks.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))   # oldest, but bank
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=5)))   # middle, non-bank
+    queue.enqueue(TaskSubmission("bank_statements", 3, iso_ts(delta_minutes=10)))  # newest, but bank
+    assert queue.age() == 600  # 10 min
+
+    # R3: non-bank middle-timestamp task pops first
+    first = queue.dequeue()
+    assert first.provider == "companies_house" and first.user_id == 2
+
+    # Oldest (@0) and newest (@10) are still present → age unchanged
+    assert queue.age() == 600
+
+
+def test_age_includes_bank_statements_in_calculation() -> None:
+    # Backward compat: age computation MUST include bank_statements tasks.
+    # R3 only changes dequeue ORDER, not which timestamps participate in age.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=15)))  # newest
+    assert queue.age() == 900  # 15 min — the bank task counts
+
+
+def test_age_includes_dependency_added_tasks() -> None:
+    # Backward compat: dependency-added tasks (companies_house from credit_check)
+    # share the parent's timestamp by design. They therefore don't change age
+    # for a single credit_check enqueue, but ARE part of the queue contents.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("credit_check", 1, iso_ts(delta_minutes=0)))      # adds companies_house@0 too
+    queue.enqueue(TaskSubmission("id_verification", 2, iso_ts(delta_minutes=10)))
+    # Three tasks in queue: companies_house@0, credit_check@0, id_verification@10
+    # max=10, min=0 → 600s
+    assert queue.age() == 600
+
+
+def test_age_unchanged_when_dedup_drops_newer_duplicate() -> None:
+    # R2 interaction: when a duplicate enqueue is dropped (newer dropped),
+    # the queue contents don't change → age stays the same.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("id_verification", 2, iso_ts(delta_minutes=5)))
+    assert queue.age() == 300
+
+    # Duplicate enqueue with NEWER timestamp → dropped (older wins)
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=20)))
+    assert queue.age() == 300  # unchanged, the new @20 was dropped
+
+
+def test_age_grows_when_dedup_replaces_existing_with_older() -> None:
+    # R2 interaction: when a duplicate enqueue REPLACES the existing
+    # (new is older), the surviving task carries the older timestamp →
+    # age can GROW relative to before the dedup if the new timestamp is
+    # older than the previous min.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=10)))
+    queue.enqueue(TaskSubmission("id_verification", 2, iso_ts(delta_minutes=15)))
+    assert queue.age() == 300  # 5 min gap (10 to 15)
+
+    # Re-enqueue companies_house at minute 0 — older → replaces existing
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    # New min=0, max=15 → 15 min = 900s. Age grew because the dedup pulled
+    # the oldest timestamp earlier.
+    assert queue.age() == 900
+
+
+def test_age_returns_integer_type() -> None:
+    # Spec contract: age() returns an integer (not float, not str).
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=5)))
+    age = queue.age()
+    assert isinstance(age, int)
+    assert age >= 0
+
+
+def test_age_works_with_full_r1_r2_r3_r4_integration() -> None:
+    # End-to-end smoke test: age coexists peacefully with all prior rounds'
+    # ordering rules and is computed correctly throughout a non-trivial run.
+    queue = QueueSolutionEntrypoint()
+
+    # Phase 1: build up a complex queue
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("credit_check", 1, iso_ts(delta_minutes=5)))      # dep: companies_house dedup'd
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=10)))  # rule of 3 fires
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=20)))
+    # Queue: [companies_house@0, credit_check@5, bank_statements@10, id_verification@20]
+    assert queue.age() == 1200  # 20 min
+
+    # Phase 2: dequeue HIGH block in R3-correct order
+    assert queue.dequeue().provider == "companies_house"  # @0 — removes oldest
+    assert queue.age() == 900   # max=20, min=5 → 15 min
+
+    assert queue.dequeue().provider == "credit_check"     # @5
+    assert queue.age() == 600   # max=20, min=10 → 10 min
+
+    assert queue.dequeue().provider == "id_verification"  # @20 — non-bank wins over bank
+    assert queue.age() == 0     # only bank_statements@10 left
+
+    assert queue.dequeue().provider == "bank_statements"  # last
+    assert queue.age() == 0     # empty
+
