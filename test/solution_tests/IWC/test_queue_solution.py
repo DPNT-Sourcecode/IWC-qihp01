@@ -704,6 +704,3 @@ def test_r3_full_integration_r1_r2_r3_compose_correctly() -> None:
         call_dequeue().expect("id_verification", 1),     # @15, but non-bank
         call_dequeue().expect("bank_statements", 1),     # @10, but bank → last
     ])
-
-
-
