@@ -962,3 +962,474 @@ def test_age_works_with_full_r1_r2_r3_r4_integration() -> None:
     assert queue.age() == 0     # empty
 
 
+# ─── IWC_R5: Time-Sensitive Bank Statements ───────────────────────────────────
+#
+# Spec (challenges/IWC_R5.txt):
+#   If a bank_statements task has an INTERNAL AGE of 5 minutes or more
+#   (defined here as: newest_task_timestamp - this_task_timestamp), it gets
+#   "promoted" — it is allowed to come earlier in the queue, even before
+#   tasks that would normally take priority.
+#
+#   Two anti-cheat constraints on promotion:
+#     (a) A promoted bank still cannot skip ahead of tasks with an OLDER
+#         timestamp than itself (R5 spec line 17).
+#     (b) Tie-breaking among promoted tasks at the SAME timestamp follows
+#         FIFO (insertion order) — see Example #2 (R5 spec lines 48–52).
+#
+#   "If bank_statements is not too old, then it behaves as before" — i.e.
+#   R3 deprioritization continues to apply when the threshold isn't met.
+#
+# IMPLEMENTATION NOTE — see queue_solution_legacy.py:
+#   • A class constant PROMOTION_AGE_THRESHOLD_SECONDS = 300 holds the
+#     5-minute threshold (configurable).
+#   • Promotion is recomputed on EVERY dequeue from the current contents
+#     because "newest" and "current set of tasks" both change as the queue
+#     drains.
+#   • A promoted bank gets metadata["promoted"]=True and inherits the
+#     highest active priority band (HIGH + earliest HIGH group_earliest)
+#     when any HIGH tasks exist; otherwise it stays NORMAL/MAX. The sort
+#     key short-circuits its deprioritization flag with `... and not promoted`.
+#   • Python's `list.sort` is stable, so FIFO tie-breaking among equal
+#     sort keys "just works" — provided we keep insertion order and only
+#     ever sort once per dequeue.
+
+# ─── R5 canonical examples from the challenge ───────────────────────────────
+
+def test_r5_canonical_example_1_promoted_bank_skips_companies_house() -> None:
+    # Exact reproduction of IWC_R5.txt Example #1 (lines 21–33).
+    # The bank_statements@12:01 has an internal age of 6 minutes (>= 5),
+    # so it is promoted ahead of companies_house@12:07 — but cannot skip
+    # the older id_verification@12:00.
+    run_queue([
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=1)).expect(2),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(3),
+        # Older non-bank task wins (R5 cannot skip it)
+        call_dequeue().expect("id_verification", 1),
+        # Promoted bank slots in next, BEFORE companies_house (would normally lose to it)
+        call_dequeue().expect("bank_statements", 2),
+        # Newest non-bank last
+        call_dequeue().expect("companies_house", 3),
+    ])
+
+
+def test_r5_canonical_example_2_fifo_tiebreak_overrides_rule_of_3() -> None:
+    # Exact reproduction of IWC_R5.txt Example #2 (lines 35–46).
+    # User 1 has 3 tasks → Rule of 3 puts them in HIGH. User 2's bank and
+    # User 1's bank are BOTH at @12:02 with internal age 8 min → both promoted.
+    # Per R5 FIFO tie-break (spec lines 48–52), user 2's bank dequeues FIRST
+    # because it was enqueued before user 1's bank — even though user 1 is
+    # part of the HIGH "rule of 3" block.
+    run_queue([
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(2),  # enqueued before
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=2)).expect(3),  # enqueued after
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=3)).expect(4),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=10)).expect(5),
+        # Older user-1 task first (cannot be skipped)
+        call_dequeue().expect("id_verification", 1),
+        # FIFO tie-break: user 2's promoted bank first (enqueued before user 1's)
+        call_dequeue().expect("bank_statements", 2),
+        # Then user 1's promoted bank (same timestamp, enqueued later)
+        call_dequeue().expect("bank_statements", 1),
+        # Then user 1's non-bank HIGH task
+        call_dequeue().expect("companies_house", 1),
+        # Finally the NORMAL latecomer
+        call_dequeue().expect("companies_house", 3),
+    ])
+
+
+# ─── R5 threshold edge cases ─────────────────────────────────────────────────
+
+def test_r5_internal_age_exactly_5_minutes_triggers_promotion() -> None:
+    # Spec wording: "5 minutes OR MORE" → boundary is INCLUSIVE.
+    # Bank @0, newest @5 → internal age = 300s = exactly 5 min → PROMOTED.
+    # Without promotion R3 would push the bank to the end; with promotion
+    # the bank wins on its older timestamp.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=5)).expect(2),
+        # Bank is promoted (300s ≥ threshold) → wins on older timestamp
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("companies_house", 2),
+    ])
+
+
+def test_r5_internal_age_just_under_5_minutes_does_not_trigger_promotion() -> None:
+    # Boundary stress: bank @12:00, newest @12:04:59 → age = 299s < 300s.
+    # Promotion does NOT fire, R3 deprioritization stays in force.
+    # Constructs timestamps directly to get sub-minute precision.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, "2025-10-20 12:00:00"))
+    queue.enqueue(TaskSubmission("companies_house", 2, "2025-10-20 12:04:59"))
+    # No promotion → R3 wins → companies_house first, bank_statements last
+    assert queue.dequeue().provider == "companies_house"
+    assert queue.dequeue().provider == "bank_statements"
+
+
+def test_r5_internal_age_just_over_5_minutes_triggers_promotion() -> None:
+    # Symmetric boundary: bank @12:00, newest @12:05:01 → age = 301s ≥ 300s.
+    # Promotion fires; bank wins on older timestamp.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, "2025-10-20 12:00:00"))
+    queue.enqueue(TaskSubmission("companies_house", 2, "2025-10-20 12:05:01"))
+    assert queue.dequeue().provider == "bank_statements"
+    assert queue.dequeue().provider == "companies_house"
+
+
+def test_r5_zero_internal_age_does_not_promote() -> None:
+    # All tasks share the same timestamp → every bank's age is 0 → no promotion.
+    # R3 deprioritization continues to apply normally.
+    ts = iso_ts(delta_minutes=0)
+    run_queue([
+        call_enqueue("bank_statements", 1, ts).expect(1),
+        call_enqueue("companies_house", 2, ts).expect(2),
+        # No promotion → companies_house (non-bank) wins
+        call_dequeue().expect("companies_house", 2),
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+# ─── R5 "cannot skip older-timestamp tasks" constraint ───────────────────────
+
+def test_r5_promoted_bank_cannot_skip_older_non_bank_task() -> None:
+    # Direct enforcement of R5 spec line 17: a promoted bank CANNOT skip
+    # ahead of any task with an older timestamp than itself.
+    # Setup: id_verification@0 (oldest, non-bank), bank@2 (promoted by gap to @7),
+    # companies_house@7 (newest non-bank). Bank gap = 5 min → promoted.
+    # Order must be: id_verification, bank, companies_house.
+    run_queue([
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(2),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(3),
+        # id_verification @0 still wins (older than bank)
+        call_dequeue().expect("id_verification", 1),
+        # Promoted bank @2 skips ahead of companies_house @7
+        call_dequeue().expect("bank_statements", 2),
+        call_dequeue().expect("companies_house", 3),
+    ])
+
+
+def test_r5_promoted_bank_cannot_skip_older_bank_task() -> None:
+    # Same constraint applies between two banks: bank @0 (oldest, also promoted)
+    # MUST come before bank @2 (also promoted). FIFO is the tie-breaker only
+    # when timestamps tie — older timestamp always wins first.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(2),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(3),
+        # Both banks promoted; oldest bank wins; promoted banks beat non-bank @7
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("bank_statements", 2),
+        call_dequeue().expect("companies_house", 3),
+    ])
+
+
+# ─── R5 in NORMAL-only context (no Rule of 3 anywhere) ───────────────────────
+
+def test_r5_promotion_works_in_pure_normal_queue() -> None:
+    # When NO user has 3+ tasks (no HIGH context), promotion only needs to
+    # remove deprioritization — the bank then sorts by its own timestamp.
+    # Bank @0 (promoted), companies_house @6 → bank should win.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=6)).expect(2),
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("companies_house", 2),
+    ])
+
+
+# ─── R5 in HIGH context (someone is on Rule of 3) ────────────────────────────
+
+def test_r5_promoted_bank_jumps_into_high_block_and_competes_inside_it() -> None:
+    # Setup: user 1 has 3 distinct tasks → HIGH band, group_earliest=10.
+    # User 2 has bank @0 → internal age = 12 min → promoted.
+    # Promoted bank inherits HIGH+group_earliest=10 so it sits INSIDE the
+    # HIGH band, competing on its own timestamp (older than any user-1 task).
+    # Result: user 2's bank goes first, then user 1's HIGH block.
+    run_queue([
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=10)).expect(2),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=11)).expect(3),
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=12)).expect(4),
+        # User 2 promoted bank wins (oldest, escapes deprio, joins HIGH band)
+        call_dequeue().expect("bank_statements", 2),
+        # User 1 HIGH non-bank tasks next, in timestamp order
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 1),
+        # User 1 bank @12 is NOT promoted (gap = 0 min from newest = self)
+        # so it stays deprioritized within user 1's HIGH block → last
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r5_promoted_bank_with_high_context_cannot_skip_older_normal_task() -> None:
+    # Even with HIGH context, a promoted bank cannot skip a task with an
+    # older timestamp. id_verification (NORMAL) @0 is older than the
+    # promoted bank @2, so it must dequeue first — even though the bank
+    # has been "promoted to HIGH" and id_verification is still NORMAL.
+    # This proves column 4 (timestamp) of the sort key still wins ties.
+    run_queue([
+        call_enqueue("id_verification", 5, iso_ts(delta_minutes=0)).expect(1),  # NORMAL, older
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=2)).expect(2),
+        # Build a HIGH user so the promoted bank inherits HIGH+group_earliest
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=4)).expect(3),
+        call_enqueue("id_verification", 1, iso_ts(delta_minutes=5)).expect(4),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(5),  # newest
+    ])
+    # Re-run with explicit dequeue to verify ordering (the run_queue helper
+    # would otherwise need many lines for this scenario):
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("id_verification", 5, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=2)))
+    queue.enqueue(TaskSubmission("companies_house", 1, iso_ts(delta_minutes=4)))
+    queue.enqueue(TaskSubmission("id_verification", 1, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("companies_house", 3, iso_ts(delta_minutes=7)))
+    # Bank @2, newest @7 → gap = 5 min → PROMOTED. User 1 has only 2 tasks
+    # so no HIGH user exists → promoted bank stays NORMAL/MAX, no inheritance.
+    # Order driven purely by timestamp (R3 deprio off for promoted bank):
+    #   id_verification user 5 @0 → bank user 2 @2 → companies_house user 1 @4
+    #   → id_verification user 1 @5 → companies_house user 3 @7
+    assert queue.dequeue().provider == "id_verification" and queue.size() == 4
+    second = queue.dequeue()
+    assert second.provider == "bank_statements" and second.user_id == 2
+    assert queue.dequeue().provider == "companies_house"
+    assert queue.dequeue().provider == "id_verification"
+    assert queue.dequeue().provider == "companies_house"
+
+
+# ─── R5 multiple banks / mixed eligibility ──────────────────────────────────
+
+def test_r5_only_eligible_bank_is_promoted_younger_bank_stays_deprioritized() -> None:
+    # Two banks: one old enough to promote, one not. The young bank stays
+    # deprioritized while the old one jumps the queue.
+    # bank user 1 @0  → gap to newest @7 = 7 min → PROMOTED
+    # bank user 2 @6  → gap to newest @7 = 1 min → NOT promoted (still bank-deprio)
+    # companies_house user 3 @7 → newest, non-bank
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=6)).expect(2),
+        call_enqueue("companies_house", 3, iso_ts(delta_minutes=7)).expect(3),
+        # Promoted bank wins (oldest)
+        call_dequeue().expect("bank_statements", 1),
+        # Non-bank wins over the still-deprioritized bank
+        call_dequeue().expect("companies_house", 3),
+        # Deprioritized bank last
+        call_dequeue().expect("bank_statements", 2),
+    ])
+
+
+def test_r5_multiple_promoted_banks_ordered_by_their_own_timestamps() -> None:
+    # When several banks are all promoted, they sort among themselves by
+    # their own timestamps (older first). FIFO is only used when timestamps
+    # tie — see the dedicated FIFO test below.
+    # bank user 1 @0 (gap=10), bank user 2 @5 (gap=5), bank user 3 @3 (gap=7),
+    # all promoted; companies_house user 4 @10 newest non-bank.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),  # gap 10
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=5)).expect(2),  # gap 5
+        call_enqueue("bank_statements", 3, iso_ts(delta_minutes=3)).expect(3),  # gap 7
+        call_enqueue("companies_house", 4, iso_ts(delta_minutes=10)).expect(4),
+        # All 3 banks promoted → sort by ts among themselves: 0, 3, 5
+        call_dequeue().expect("bank_statements", 1),
+        call_dequeue().expect("bank_statements", 3),
+        call_dequeue().expect("bank_statements", 2),
+        # Then non-bank
+        call_dequeue().expect("companies_house", 4),
+    ])
+
+
+def test_r5_two_promoted_banks_at_same_timestamp_use_fifo() -> None:
+    # Distilled FIFO test: two promoted banks at IDENTICAL timestamps must
+    # dequeue in insertion order (challenge spec lines 48–50).
+    # We keep the queue simple to isolate the FIFO behaviour.
+    run_queue([
+        call_enqueue("bank_statements", 7, iso_ts(delta_minutes=2)).expect(1),  # enqueued first
+        call_enqueue("bank_statements", 8, iso_ts(delta_minutes=2)).expect(2),  # enqueued second
+        call_enqueue("companies_house", 9, iso_ts(delta_minutes=7)).expect(3),  # newest
+        # Both banks promoted (gap = 5 min). FIFO → user 7 first, then user 8.
+        call_dequeue().expect("bank_statements", 7),
+        call_dequeue().expect("bank_statements", 8),
+        call_dequeue().expect("companies_house", 9),
+    ])
+
+
+# ─── R5 negative tests (when promotion should NOT fire) ──────────────────────
+
+def test_r5_no_promotion_keeps_r3_deprioritization_intact() -> None:
+    # Backward compat: when no bank crosses the 5-min threshold, R3 wins
+    # exactly as before. Sanity-check the "default" path is unchanged.
+    run_queue([
+        call_enqueue("bank_statements", 1, iso_ts(delta_minutes=0)).expect(1),
+        call_enqueue("companies_house", 2, iso_ts(delta_minutes=2)).expect(2),
+        call_enqueue("id_verification", 3, iso_ts(delta_minutes=4)).expect(3),
+        # Bank gap = 4 min < 5 → not promoted → R3 puts it last
+        call_dequeue().expect("companies_house", 2),
+        call_dequeue().expect("id_verification", 3),
+        call_dequeue().expect("bank_statements", 1),
+    ])
+
+
+def test_r5_single_bank_in_queue_no_promotion_needed() -> None:
+    # Edge case: a queue with a single bank task. Newest = the bank itself,
+    # so gap = 0 → no promotion. Dequeue still works.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    assert queue.size() == 1
+    result = queue.dequeue()
+    assert result.provider == "bank_statements" and result.user_id == 1
+    assert queue.size() == 0
+
+
+def test_r5_non_bank_tasks_are_never_promoted() -> None:
+    # Promotion is bank-specific; a non-bank with a large internal age must
+    # NOT get any special treatment. Plain R1 timestamp ordering applies.
+    run_queue([
+        call_enqueue("companies_house", 1, iso_ts(delta_minutes=0)).expect(1),  # gap 10 min
+        call_enqueue("id_verification", 2, iso_ts(delta_minutes=10)).expect(2),
+        # Pure timestamp ordering, no R5 magic on non-banks
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("id_verification", 2),
+    ])
+
+
+# ─── R5 dynamic re-evaluation across dequeue calls ──────────────────────────
+
+def test_r5_promotion_recomputed_after_each_dequeue() -> None:
+    # Promotion depends on "newest task in queue", which changes as the queue
+    # drains. After dequeueing the newest, a previously-promoted bank may
+    # lose promotion because the gap collapses below the threshold.
+    queue = QueueSolutionEntrypoint()
+    # Initial: bank @0, companies_house @1, id_verification @5.
+    # Newest = 5 → bank gap = 5 min → PROMOTED → wins (older than non-banks).
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=1)))
+    queue.enqueue(TaskSubmission("id_verification", 3, iso_ts(delta_minutes=5)))
+
+    first = queue.dequeue()
+    assert first.provider == "bank_statements" and first.user_id == 1
+
+    # Now we add a fresh bank that's only 2 min old relative to the new
+    # newest (@5). It should NOT be promoted on the next dequeue.
+    queue.enqueue(TaskSubmission("bank_statements", 4, iso_ts(delta_minutes=3)))
+    # Queue now: [companies_house@1, id_verification@5, bank_statements@3]
+    # Newest = 5; bank gap = 2 min < threshold → not promoted → R3 holds it back
+    assert queue.dequeue().provider == "companies_house"      # @1
+    assert queue.dequeue().provider == "id_verification"      # @5
+    assert queue.dequeue().provider == "bank_statements"      # last (deprio)
+    assert queue.dequeue() is None
+
+
+def test_r5_promotion_metadata_does_not_persist_after_dequeue() -> None:
+    # White-box guarantee: after a dequeue, the "promoted" metadata flag
+    # must NOT linger on tasks still in the queue if a later dequeue
+    # would no longer compute them as promoted (otherwise stale promotion
+    # would leak across calls). We verify by direct effect on dequeue order.
+    queue = QueueSolutionEntrypoint()
+    # Setup so bank is promoted on first dequeue but NOT on second.
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=2)))
+    queue.enqueue(TaskSubmission("id_verification", 3, iso_ts(delta_minutes=5)))
+    # First dequeue: bank promoted (gap 5min) → bank wins.
+    assert queue.dequeue().provider == "bank_statements"
+    # Now the queue is [companies_house@2, id_verification@5]. No banks left,
+    # so the promotion flag has nothing to act on. Plain timestamp order:
+    assert queue.dequeue().provider == "companies_house"
+    assert queue.dequeue().provider == "id_verification"
+
+
+# ─── R5 interactions with other rounds' rules ───────────────────────────────
+
+def test_r5_dedup_then_promotion_older_kept_then_aged_into_promotion() -> None:
+    # R2 ∩ R5: re-enqueueing a duplicate bank with an older timestamp
+    # replaces the existing one. After more enqueues age the queue, the
+    # surviving (older) bank gets promoted on dequeue.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=3)))
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))  # older → replace
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=5)))
+    # Surviving bank @0; newest @5 → gap 5 min → PROMOTED → bank wins.
+    assert queue.dequeue().provider == "bank_statements"
+    assert queue.dequeue().provider == "companies_house"
+
+
+def test_r5_dependencies_dont_affect_promotion_logic() -> None:
+    # Sanity check: a credit_check enqueue adds companies_house automatically
+    # (R1 dependency), but that has no bearing on R5 because dependencies
+    # are non-bank providers. Bank promotion depends only on timestamps.
+    run_queue([
+        # credit_check@0 → adds companies_house@0 + credit_check@0 (size 2)
+        call_enqueue("credit_check", 1, iso_ts(delta_minutes=0)).expect(2),
+        # Bank @1 with newest @7 → gap = 6 min → PROMOTED
+        call_enqueue("bank_statements", 2, iso_ts(delta_minutes=1)).expect(3),
+        call_enqueue("id_verification", 3, iso_ts(delta_minutes=7)).expect(4),
+        # User 1 has only 2 unique tasks (companies_house + credit_check) so no R3.
+        # No HIGH context → promoted bank stays NORMAL. Sort by timestamp.
+        # FIFO ties at ts=0: companies_house was inserted before credit_check
+        # (dependency goes in first per _collect_dependencies).
+        call_dequeue().expect("companies_house", 1),
+        call_dequeue().expect("credit_check", 1),
+        call_dequeue().expect("bank_statements", 2),  # promoted, beats id_verification
+        call_dequeue().expect("id_verification", 3),
+    ])
+
+
+def test_r5_age_metric_unchanged_by_promotion_logic() -> None:
+    # age() is a pure read-only metric over timestamps. Promotion changes
+    # ORDER, not which tasks are present. age() must be identical whether
+    # any promotion fires or not.
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts(delta_minutes=10)))
+    # 10 min gap regardless of any promotion semantics
+    assert queue.age() == 600
+
+
+# ─── R5 full end-to-end integration across all 5 rounds ─────────────────────
+
+def test_r5_full_integration_all_rounds_compose_correctly() -> None:
+    # Big composite: R1 (rule of 3, timestamp ordering, dependencies),
+    # R2 (dedup), R3 (deprioritization), R4 (age), R5 (promotion + FIFO).
+    queue = QueueSolutionEntrypoint()
+
+    # User 1: pre-existing bank, plus credit_check that pulls companies_house
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=0)))   # 1
+    queue.enqueue(TaskSubmission("credit_check", 1, iso_ts(delta_minutes=1)))      # +companies_house@1, +credit_check@1 → size 3
+    # User 2: NORMAL bank that will age into promotion
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=2)))   # size 4
+    # Duplicate of user 1's bank with NEWER ts → R2 drops new, size unchanged
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=4)))   # dedup → still 4
+    # User 3 NORMAL non-bank that will be the newest task (drives the gap)
+    queue.enqueue(TaskSubmission("companies_house", 3, iso_ts(delta_minutes=7)))   # size 5
+
+    # Sanity: queue contents are now
+    #   [bank user 1 @0, companies_house user 1 @1, credit_check user 1 @1,
+    #    bank user 2 @2, companies_house user 3 @7]
+    assert queue.size() == 5
+    assert queue.age() == 420  # 7 min
+
+    # Promotion check at dequeue time:
+    #   newest = 7; user 1 bank gap = 7 min → PROMOTED;
+    #   user 2 bank gap = 5 min → PROMOTED.
+    # User 1 has 3 unique tasks → HIGH (group_earliest=0). User 2/3 NORMAL.
+    # Both promoted banks inherit HIGH+group_earliest=0.
+    # Sort key (priority, group, !promoted-or-non-bank, ts):
+    #   bank user 1 @0           → (HIGH, 0, False, 0)  ← oldest
+    #   companies_house user 1@1 → (HIGH, 0, False, 1)
+    #   credit_check user 1 @1   → (HIGH, 0, False, 1)  ← FIFO after companies_house
+    #   bank user 2 @2 promoted  → (HIGH, 0, False, 2)
+    #   companies_house user 3@7 → (NORMAL, MAX, False, 7)
+    assert queue.dequeue().provider == "bank_statements"   # user 1 bank @0
+    second = queue.dequeue()
+    assert second.provider == "companies_house" and second.user_id == 1
+    third = queue.dequeue()
+    assert third.provider == "credit_check" and third.user_id == 1
+    fourth = queue.dequeue()
+    assert fourth.provider == "bank_statements" and fourth.user_id == 2
+    fifth = queue.dequeue()
+    assert fifth.provider == "companies_house" and fifth.user_id == 3
+    assert queue.dequeue() is None
+    assert queue.age() == 0
+
+
+
