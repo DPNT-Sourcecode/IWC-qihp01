@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from solutions.IWC.queue_solution_entrypoint import QueueSolutionEntrypoint
+from solutions.IWC.task_types import TaskSubmission
+
 from .utils import call_dequeue, call_enqueue, call_size, iso_ts, run_queue
 
 
@@ -167,4 +170,60 @@ def test_size_decreases_with_each_dequeue() -> None:
         call_dequeue().expect("bank_statements", 2),
         call_size().expect(0),
     ])
+
+
+def test_two_users_both_trigger_rule_of_3_compete_on_earliest_timestamp() -> None:
+    # Edge case: when TWO users both have 3+ tasks, both groups are HIGH.
+    # The tie-breaker is the EARLIEST timestamp of each user's group —
+    # the user whose oldest task is older wins.
+    queue = QueueSolutionEntrypoint()
+
+    # User 1 — 3 tasks at minutes 5, 6, 7
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=5)))
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=6)))
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts(delta_minutes=7)))
+
+    # User 2 — 3 tasks at minutes 0, 1, 2 (overall earlier)
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=0)))
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=1)))
+    queue.enqueue(TaskSubmission("bank_statements", 2, iso_ts(delta_minutes=2)))
+
+    # All three of user 2's tasks come first (earlier group_earliest_timestamp),
+    # then user 1's three tasks.
+    user_order = [queue.dequeue().user_id for _ in range(6)]
+    assert user_order == [2, 2, 2, 1, 1, 1]
+
+
+# ─── Direct entrypoint tests for purge / age / empty-dequeue ──────────────────
+# The framework helpers don't cover these methods, so we use the entrypoint
+# directly. These prove the full public API works as documented.
+
+def test_dequeue_on_empty_queue_returns_none() -> None:
+    # Calling dequeue on an empty queue must return None (not raise).
+    queue = QueueSolutionEntrypoint()
+    assert queue.dequeue() is None
+
+
+def test_purge_clears_all_tasks_and_returns_true() -> None:
+    queue = QueueSolutionEntrypoint()
+    queue.enqueue(TaskSubmission("bank_statements", 1, iso_ts()))
+    queue.enqueue(TaskSubmission("companies_house", 2, iso_ts()))
+    assert queue.size() == 2
+
+    result = queue.purge()
+    assert result is True
+    assert queue.size() == 0
+    assert queue.dequeue() is None  # nothing left after purge
+
+
+def test_age_returns_a_non_negative_integer() -> None:
+    # Contract test: age() must return a non-negative int.
+    # The legacy implementation currently always returns 0, but the spec
+    # says "age in seconds" — future rounds may make this dynamic.
+    # We only assert what the SPEC guarantees, not what the legacy bug returns.
+    queue = QueueSolutionEntrypoint()
+    age = queue.age()
+    assert isinstance(age, int)
+    assert age >= 0
+
 
