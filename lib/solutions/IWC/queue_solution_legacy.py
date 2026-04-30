@@ -96,6 +96,12 @@ class Queue:
     # sort logic.
     DEPRIORITIZED_PROVIDERS: frozenset[str] = frozenset({"bank_statements"})
 
+    # IWC_R5 — Time-Sensitive Bank Statements. A deprioritized task whose
+    # internal age (= newest_ts_in_queue - task.ts) reaches this threshold
+    # is "promoted" and escapes R3 deprioritization. Stored as a class-level
+    # constant so it's trivially configurable and self-documenting.
+    PROMOTION_AGE_THRESHOLD_SECONDS: int = 300  # 5 minutes per IWC_R5 spec
+
     @classmethod
     def _is_deprioritized(cls, task) -> bool:
         return task.provider in cls.DEPRIORITIZED_PROVIDERS
@@ -170,25 +176,67 @@ class Queue:
             else:
                 metadata["group_earliest_timestamp"] = current_earliest
                 metadata["priority"] = priority_level
+            # IWC_R5 — clear any stale promotion flag from a previous dequeue;
+            # promotion is recomputed from scratch on every call so the queue
+            # always reflects the current set of tasks.
+            metadata.pop("promoted", None)
 
-        # IWC_R3 — Bank-statements deprioritization.
-        # The 4-tuple sort key encodes:
-        #   1. priority      — HIGH (rule of 3) beats NORMAL globally
-        #   2. group_earliest_timestamp — within HIGH, oldest user group wins
-        #   3. is_deprioritized — within the same priority/group bucket,
-        #      non-bank_statements (False) beats bank_statements (True).
-        #      • Inside a HIGH user group → user's bank_statements lands last
-        #        among their own tasks (sub-rule #2 of IWC_R3).
-        #      • Across all NORMAL tasks (same group_earliest=MAX) →
-        #        bank_statements lands at the global end of the NORMAL section
-        #        (sub-rule #1 of IWC_R3).
-        #   4. timestamp — final tie-breaker; preserves "Timestamp Ordering"
-        #      among non-bank tasks AND among bank tasks separately.
+        # IWC_R5 — Time-Sensitive Bank Statements (anti-starvation override of R3).
+        # A deprioritized bank_statements task whose internal age (the gap
+        # between its timestamp and the NEWEST task's timestamp) reaches
+        # PROMOTION_AGE_THRESHOLD_SECONDS gets "promoted":
+        #   - It escapes R3 deprioritization (False in column 3 of the sort key).
+        #   - If any HIGH-priority tasks are currently in the queue, it inherits
+        #     the highest priority band (HIGH + the earliest HIGH group_earliest)
+        #     so it can skip ahead of HIGH non-bank tasks with NEWER timestamps
+        #     (per the spec's example #2). It still cannot skip OLDER-timestamp
+        #     tasks because column 4 of the sort key is the task's own timestamp.
+        #   - If no HIGH tasks exist, removing deprioritization is sufficient
+        #     (per the spec's example #1).
+        # Promotion is recomputed at every dequeue so it stays correct as tasks
+        # come and go (it depends on the current "newest" task in the queue).
+        newest_ts = max(self._timestamp_for_task(t) for t in self._queue)
+        high_groups = [
+            t.metadata.get("group_earliest_timestamp", MAX_TIMESTAMP)
+            for t in self._queue
+            if t.metadata.get("priority") == Priority.HIGH
+        ]
+        has_high = bool(high_groups)
+        earliest_high_group_ts = min(high_groups) if has_high else MAX_TIMESTAMP
+
+        for task in self._queue:
+            if not self._is_deprioritized(task):
+                continue
+            task_ts = self._timestamp_for_task(task)
+            age_seconds = (newest_ts - task_ts).total_seconds()
+            if age_seconds >= self.PROMOTION_AGE_THRESHOLD_SECONDS:
+                task.metadata["promoted"] = True
+                if has_high:
+                    task.metadata["priority"] = Priority.HIGH
+                    task.metadata["group_earliest_timestamp"] = earliest_high_group_ts
+                # If no HIGH context exists, leave priority=NORMAL and
+                # group_earliest=MAX_TIMESTAMP — the only effect needed in
+                # that case is removing deprioritization in the sort key.
+
+        # IWC_R3/R5 — Sort key explanation:
+        #   1. priority      — HIGH (rule of 3, OR R5 promotion when HIGH context
+        #                      exists) beats NORMAL globally.
+        #   2. group_earliest_timestamp — within HIGH, oldest user group wins.
+        #                      R5-promoted banks borrow the earliest HIGH group
+        #                      so they can sit inside that band.
+        #   3. is_deprioritized — non-bank (False) beats bank (True). R5-promoted
+        #                      banks short-circuit this to False — see lambda
+        #                      below: `_is_deprioritized(i) and not promoted`.
+        #   4. timestamp — final tie-breaker. Older timestamp wins, which honours
+        #                      both R1 Timestamp Ordering AND R5's "promoted bank
+        #                      must not skip older-timestamp tasks" constraint.
+        # FIFO ties among same-key tasks are preserved automatically because
+        # Python's `list.sort` is stable.
         self._queue.sort(
             key=lambda i: (
                 self._priority_for_task(i),
                 self._earliest_group_timestamp_for_task(i),
-                self._is_deprioritized(i),
+                self._is_deprioritized(i) and not i.metadata.get("promoted"),
                 self._timestamp_for_task(i),
             )
         )
@@ -312,3 +360,4 @@ async def queue_worker():
         logger.info(f"Finished task: {task}")
 ```
 """
+
